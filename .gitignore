@@ -158,6 +158,7 @@ venv/
 ENV/
 env.bak/
 venv.bak/
+discordenv
 
 # Spyder project settings
 .spyderproject
@@ -218,3 +219,7 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Bot Generated Data
+monthly_stats/
+greeted_users.txt
