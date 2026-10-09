@@ -230,5 +230,101 @@ class Analytics(commands.Cog):
         
         await ctx.send(embed=embed)
 
+    @commands.command(name="pronounstats")
+    async def pronounstats(self, ctx, year: int = None):
+        if os.getenv("ENABLE_CMD_PRONOUNSTATS", "True").lower() not in ("true", "1", "t"):
+            return
+            
+        if year is None:
+            year = datetime.now().year
+
+        status_msg = await ctx.send(f"📊 Calculating active users and retrieving roles for {year}...")
+
+        # Exact roles mapped from the provided image
+        target_roles = [
+            "He/Him", 
+            "She/Her", 
+            "They/Them", 
+            "Use my name", 
+            "Any/All", 
+            "Ask for pronouns"
+        ]
+        
+        role_counts = {role: 0 for role in target_roles}
+        role_counts["Unknown"] = 0
+        
+        # We use a set so if a user is active in multiple months, they are only counted once
+        active_users = set()
+
+        # 1. Identify all active users for the specified year using the archives
+        for month in range(1, 13):
+            filename = f"monthly_stats/stats_{year}_{month:02d}.json"
+            if os.path.exists(filename):
+                try:
+                    with open(filename, 'r') as f:
+                        data = json.load(f)
+                        for uid, info in data.get("users", {}).items():
+                            total_msgs = sum(info.get("channels", {}).values())
+                            if total_msgs >= 50:
+                                active_users.add(int(uid))
+                except json.JSONDecodeError:
+                    pass
+
+        if not active_users:
+            await status_msg.delete()
+            return await ctx.send(f"ℹ️ No active users (50+ messages in a month) found in the archives for {year}.")
+
+        # 2. Check current server roles for each active user
+        for uid in active_users:
+            member = ctx.guild.get_member(uid)
+            if member:
+                member_role_names = [r.name for r in member.roles]
+                matched_any = False
+                
+                # Check for each specific role
+                for tr in target_roles:
+                    if tr in member_role_names:
+                        role_counts[tr] += 1
+                        matched_any = True
+                        
+                # If they have none of the target roles, mark as Unknown
+                if not matched_any:
+                    role_counts["Unknown"] += 1
+            else:
+                # If the user left the server, we cannot check their roles
+                role_counts["Unknown"] += 1
+
+        # 3. Generate the Bar Chart
+        plt.figure(figsize=(12, 6))
+        categories = list(role_counts.keys())
+        counts = list(role_counts.values())
+        
+        # Color palette: Orange for the target roles (to match the icon), Grey for Unknown
+        colors = ['#f97316'] * len(target_roles) + ['#64748b']
+        
+        bars = plt.bar(categories, counts, color=colors)
+        plt.title(f"Active User Demographics for {year}\n(Active = 50+ messages in a single month)")
+        plt.xlabel("Assigned Roles")
+        plt.ylabel("Number of Active Users")
+        plt.xticks(rotation=45, ha='right')
+        plt.grid(axis='y', linestyle='--', alpha=0.7)
+        
+        # Add the numerical value on top of each bar for easier reading
+        for bar in bars:
+            yval = bar.get_height()
+            plt.text(bar.get_x() + bar.get_width()/2, yval + (max(counts) * 0.02), 
+                     int(yval), ha='center', va='bottom', fontweight='bold')
+                     
+        plt.tight_layout()
+        
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png")
+        buf.seek(0)
+        plt.close()
+        
+        file = discord.File(fp=buf, filename="pronoun_stats.png")
+        await status_msg.delete()
+        await ctx.send(f"Here are the active user demographic statistics for {year}:", file=file)
+
 async def setup(bot):
     await bot.add_cog(Analytics(bot))
