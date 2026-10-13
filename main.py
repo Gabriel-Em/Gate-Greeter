@@ -83,8 +83,8 @@ async def help_command(ctx):
             "active": analytics_enabled and os.getenv("ENABLE_CMD_TOPUSERS", "True").lower() in ("true", "1", "t")
         },
         {
-            "name": "!activity30 <@user/user_id>",
-            "desc": "Generates 30-day hourly and daily message graphs (server-wide or per-user).",
+            "name": "!activity30",
+            "desc": "Generates 30-day hourly and daily server-wide message graphs.",
             "active": analytics_enabled and os.getenv("ENABLE_CMD_ACTIVITY30", "True").lower() in ("true", "1", "t")
         },
         {

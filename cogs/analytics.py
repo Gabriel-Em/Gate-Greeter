@@ -72,17 +72,11 @@ class Analytics(commands.Cog):
         await status_msg.edit(content="✅ 12-month data archive is up to date!")
 
     @commands.command(name="activity30")
-    async def activity30(self, ctx, target_user_id: str = None):
+    async def activity30(self, ctx):
         if os.getenv("ENABLE_CMD_ACTIVITY30", "True").lower() not in ("true", "1", "t"):
             return # Command is disabled
 
-        if target_user_id:
-            target_user_id = target_user_id.replace('<@', '').replace('!', '').replace('>', '')
-            status_msg = await ctx.send(f"📈 Compiling metrics for user `{target_user_id}`...")
-            title_context = f"User: {target_user_id}"
-        else:
-            status_msg = await ctx.send("📈 Compiling 30-day activity metrics for the server...")
-            title_context = "Server-wide"
+        status_msg = await ctx.send("📈 Compiling 30-day activity metrics for the server...")
         
         now = datetime.now()
         start_dt = now - timedelta(days=30)
@@ -96,7 +90,6 @@ class Analytics(commands.Cog):
             try:
                 async for msg in channel.history(limit=None, after=start_dt):
                     if msg.author.bot: continue
-                    if target_user_id and str(msg.author.id) != target_user_id: continue
                     
                     local_time = msg.created_at + timedelta(hours=3)
                     hourly_counts[local_time.hour] += 1
@@ -109,7 +102,7 @@ class Analytics(commands.Cog):
 
         plt.figure(figsize=(10, 5))
         plt.bar(list(hourly_counts.keys()), list(hourly_counts.values()), color='#3b82f6')
-        plt.title(f"Activity by Hour (Local Time) [{title_context}]")
+        plt.title("Activity by Hour (Local Time) [Server-wide]")
         plt.xlabel("Hour (0:00 - 23:00)")
         plt.ylabel("Total Messages")
         plt.xticks(range(24))
@@ -124,7 +117,7 @@ class Analytics(commands.Cog):
         plt.figure(figsize=(12, 5))
         sorted_days = sorted(daily_counts.items())
         plt.plot([i[0] for i in sorted_days], [i[1] for i in sorted_days], marker='o', color='#10b981', linewidth=2)
-        plt.title(f"Daily Activity (Last 30 Days) [{title_context}]")
+        plt.title("Daily Activity (Last 30 Days) [Server-wide]")
         plt.xlabel("Date")
         plt.ylabel("Messages")
         plt.xticks(rotation=45, ha='right')
@@ -138,9 +131,6 @@ class Analytics(commands.Cog):
 
         file_hourly = discord.File(fp=buf_hourly, filename="hourly_activity.png")
         file_daily = discord.File(fp=buf_daily, filename="daily_activity.png")
-        
-        await status_msg.delete()
-        await ctx.send(f"Here is the breakdown for the last 30 days ({title_context}):", files=[file_hourly, file_daily])
 
     @commands.command(name="topusers")
     async def topusers(self, ctx, year: int = None, month: int = None):
