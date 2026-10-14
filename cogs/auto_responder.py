@@ -27,7 +27,7 @@ class AutoResponder(commands.Cog):
 
         # 1. VO2 Max Check
         if os.getenv("ENABLE_RESP_VO2MAX", "True").lower() in ("true", "1", "t"):
-            vo2_pattern = r"what('s|\s+is|s)?\s+vo2\s*max"
+            vo2_pattern = r"what\b.*?\bvo2(\s*max)?\b"
             if re.search(vo2_pattern, message.content, re.IGNORECASE):
                 explanation = (
                     "VO2 max (maximal oxygen consumption) is the maximum amount of oxygen "
