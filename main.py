@@ -60,8 +60,16 @@ async def on_command_error(ctx, error):
         await ctx.send("🚫 You don't have permission to use this command.")
         return
 
+    # 5. Catch internal code crashes (like UnboundLocalError) and send to Discord
+    if isinstance(error, commands.CommandInvokeError):
+        original_error = error.original
+        print(f"[Unhandled Error] in command {ctx.command}: {original_error}")
+        await ctx.send(f"❌ **Internal Code Error:** `{type(original_error).__name__}: {original_error}`")
+        return
+
     # Fallback: Print uncaught errors to console so you can still debug them
     print(f"[Unhandled Error] in command {ctx.command}: {error}")
+    await ctx.send(f"❌ **Unexpected Error:** `{error}`")
 
 # ---------------------------------------------------------
 # Custom Help Command

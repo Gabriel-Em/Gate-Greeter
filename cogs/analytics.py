@@ -166,12 +166,16 @@ class Analytics(commands.Cog):
             filename = f"monthly_stats/stats_{year}_{m:02d}.json"
             
             needs_scrape = False
+            existing_data = {}
+            
             if not os.path.exists(filename):
                 needs_scrape = True
             else:
                 try:
                     with open(filename, 'r') as f:
-                        if not json.load(f).get('complete', False): needs_scrape = True
+                        existing_data = json.load(f)
+                        if not existing_data.get('complete', False): 
+                            needs_scrape = True
                 except json.JSONDecodeError:
                     needs_scrape = True
 
