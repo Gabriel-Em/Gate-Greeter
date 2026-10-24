@@ -127,8 +127,9 @@ class Moderation(commands.Cog):
                                     msg = f"👑 **MAX LEVEL!** {member.mention} achieved 20 misclicks and has ascended to **{target_role_name}**!"
                                 else:
                                     msg = f"👴 {member.mention} just misclicked into `{before.channel.name}`! (Total misclicks: {current_count})"
-                                
+
                                 await general_channel.send(msg)
+                                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
 
                         except discord.Forbidden:
                             print(f"⚠️ Could not manage unc roles for {member.name}: The bot lacks permissions or the role hierarchy is incorrect.")
@@ -197,6 +198,7 @@ class Moderation(commands.Cog):
         # Apply the changes all at once
         await member.edit(roles=new_roles, reason="Sent to Rada's Prison Island")
         await ctx.send(f"🔒 {member.mention} has been sent to **Rada’s Prison Island**.")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔒 {member.mention} has been sent to **Rada’s Prison Island**.")
 
     @commands.command(name="release")
     @commands.has_permissions(manage_roles=True)
@@ -229,6 +231,7 @@ class Moderation(commands.Cog):
 
         await member.edit(roles=roles_to_restore, reason="Released from Rada's Prison Island")
         await ctx.send(f"✅ {member.mention} has been released from **Rada’s Prison Island**.")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.mention} has been released from **Rada’s Prison Island**.")
 
     # ---------------------------------------------------------
     # EVASION PREVENTION (Rejoining Inmates)
@@ -247,7 +250,7 @@ class Moderation(commands.Cog):
                 return
 
             # Re-apply the prison lockdown
-            new_roles = [member.guild.default_role]
+            new_roles = []
             for role in member.roles:
                 if role.id in self.category_role_ids:
                     new_roles.append(role)
@@ -255,8 +258,19 @@ class Moderation(commands.Cog):
             inmate_role = member.guild.get_role(self.inmate_role_id)
             if inmate_role:
                 new_roles.append(inmate_role)
-                
+            
+            # Strip unauthorized roles
             await member.edit(roles=new_roles, reason="Fleeing inmate rejoined. Sent back to prison.")
+
+            # Announce the evasion attempt in general chat
+            general_channel = discord.utils.get(member.guild.text_channels, name="general")
+            if general_channel:
+                await general_channel.send(
+                    f"🚨 **Prison Evasion Attempted!** {member.mention} tried to flee the server and rejoin to clear their roles, "
+                    f"but Gate Greeter immediately dragged them back to **Rada’s Prison Island**."
+                )
+                print(f"Successfully announced prison evasion for {member.name}.")
+                
 
 async def setup(bot):
     await bot.add_cog(Moderation(bot))
