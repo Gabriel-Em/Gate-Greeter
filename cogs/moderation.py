@@ -11,6 +11,9 @@ class Moderation(commands.Cog):
         # Format: {member_id: {"time": datetime_object, "channel_id": int}}
         self.voice_join_times = {}
 
+        # Anti-Spam Buffer: {member_id: datetime_object}
+        self.unc_cooldowns = {}
+
         # Prison System Configuration
         self.prison_file = "prison_data.json"
         self.inmate_role_id = 1351480622497009685
@@ -26,11 +29,31 @@ class Moderation(commands.Cog):
             with open(self.prison_file, "w") as f:
                 json.dump({}, f)
 
+        # Unc System Configuration
+        self.unc_file = "unc_data.json"
+        
+        if not os.path.exists(self.unc_file):
+            with open(self.unc_file, "w") as f:
+                json.dump({}, f)
+
+    def load_unc_data(self):
+        try:
+            with open(self.unc_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+    def save_unc_data(self, data):
+        with open(self.unc_file, "w") as f:
+            json.dump(data, f, indent=4)
+
+    # ---------------------------------------------------------
+    # VOICE MISCLICK TRACKER (The Unc Dynasty)
+    # ---------------------------------------------------------
     @commands.Cog.listener()
     async def on_voice_state_update(self, member, before, after):
-        # Ignore simple mute/deafen updates within the same channel
-        if before.channel == after.channel:
-            return
+        if member.bot: return
+        if before.channel == after.channel: return
 
         now = datetime.now()
 
@@ -42,27 +65,77 @@ class Moderation(commands.Cog):
                 
                 # Check for misclick (< 3s)
                 if duration < 3.0:
-                    unc_role = discord.utils.get(member.guild.roles, name="unc")
-                    if unc_role:
+                    # --- ANTI-SPAM COOLDOWN CHECK ---
+                    last_misclick = self.unc_cooldowns.get(member.id)
+                    # 3600 seconds = 1 hour cooldown. Adjust this number if you want a longer/shorter buffer.
+                    if last_misclick and (now - last_misclick).total_seconds() < 3600:
+                        if member.id in self.voice_join_times:
+                            del self.voice_join_times[member.id]
+                        return # Silently ignore the farming attempt
+
+                    # Record the time of this valid misclick to start their cooldown timer
+                    self.unc_cooldowns[member.id] = now
+                    # --------------------------------
+
+                    # 1. Load data and increment their count
+                    unc_data = self.load_unc_data()
+                    uid = str(member.id)
+                    current_count = unc_data.get(uid, 0) + 1
+                    unc_data[uid] = current_count
+                    self.save_unc_data(unc_data)
+
+                    # 2. Determine their level and target role
+                    if current_count < 5:
+                        target_role_name = "Unc"
+                    elif current_count < 10:
+                        target_role_name = "Grand Unc"
+                    elif current_count < 15:
+                        target_role_name = "Great-Grand Unc"
+                    elif current_count < 20:
+                        target_role_name = "Ancestral Unc"
+                    else:
+                        target_role_name = "The First Unc"
+
+                    # Fetch the role from the server (case-sensitive to match Discord exactly)
+                    target_role = discord.utils.get(member.guild.roles, name=target_role_name)
+                    
+                    # 3. Apply the role and announce
+                    if target_role:
                         try:
-                            await member.add_roles(unc_role)
-                            print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Assigned 'unc' role to {member.name}")
+                            # Strip any old unc roles from the progression tree to prevent duplicates
+                            dynasty_roles = ["Unc", "Grand Unc", "Great-Grand Unc", "Ancestral Unc", "The First Unc"]
+                            old_roles = [r for r in member.roles if r.name in dynasty_roles and r.id != target_role.id]
                             
+                            if old_roles:
+                                await member.remove_roles(*old_roles)
+                                
+                            if target_role not in member.roles:
+                                await member.add_roles(target_role)
+
                             general_channel = discord.utils.get(member.guild.text_channels, name="general")
                             if general_channel:
-                                await general_channel.send(
-                                    f"👴 {member.mention} just earned the **unc** role for misclicking "
-                                    f"into the `{before.channel.name}` voice channel!"
-                                )
-                            else:
-                                print("⚠️ Could not find a channel named 'general' to post the announcement.")
+                                # Custom messages based on milestones
+                                if current_count == 1:
+                                    msg = f"👴 {member.mention} just earned the **{target_role_name}** role for missclicking into the `{before.channel.name}` voice channel!"
+                                elif current_count == 5:
+                                    msg = f"🌟 **LEVEL UP!** {member.mention} misclicked for the 5th time and evolved into a **{target_role_name}**!"
+                                elif current_count == 10:
+                                    msg = f"📜 **LEVEL UP!** {member.mention} hit 10 misclicks and aged into a **{target_role_name}**!"
+                                elif current_count == 15:
+                                    msg = f"🏺 **LEVEL UP!** {member.mention} reached 15 misclicks and is now recognized as an **{target_role_name}**!"
+                                elif current_count == 20:
+                                    msg = f"👑 **MAX LEVEL!** {member.mention} achieved 20 misclicks and has ascended to **{target_role_name}**!"
+                                else:
+                                    msg = f"👴 {member.mention} just misclicked into `{before.channel.name}`! (Total misclicks: {current_count})"
+                                
+                                await general_channel.send(msg)
+
                         except discord.Forbidden:
-                            print(f"⚠️ Could not assign role to {member.name}: The bot lacks permissions.")
-                    else:
-                        print("⚠️ Could not find a role named 'unc' in this server.")
+                            print(f"⚠️ Could not manage unc roles for {member.name}: The bot lacks permissions or the role hierarchy is incorrect.")
                 
                 # Clean up memory
-                del self.voice_join_times[member.id]
+                if member.id in self.voice_join_times:
+                    del self.voice_join_times[member.id]
 
         # Event: Joined a channel
         if after.channel is not None:
