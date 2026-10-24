@@ -83,6 +83,8 @@ async def help_command(ctx):
     )
 
     analytics_enabled = os.getenv("ENABLE_ANALYTICS", "True").lower() in ("true", "1", "t")
+    moderation_enabled = os.getenv("ENABLE_MODERATION", "True").lower() in ("true", "1", "t")
+    prison_active = moderation_enabled and os.getenv("ENABLE_CMD_PRISON", "True").lower() in ("true", "1", "t")
 
     commands_info = [
         {
@@ -104,6 +106,16 @@ async def help_command(ctx):
             "name": "!pronounstats <year>",
             "desc": "Graphs demographics for active users (50+ messages/month) by pronoun roles.",
             "active": analytics_enabled and os.getenv("ENABLE_CMD_PRONOUNSTATS", "True").lower() in ("true", "1", "t")
+        },
+        {
+            "name": "!prison @user",
+            "desc": "Strips a user's roles (except categories), saves them, and sends them to Prison Island.",
+            "active": prison_active
+        },
+        {
+            "name": "!release @user",
+            "desc": "Releases an inmate and restores all their previous roles.",
+            "active": prison_active
         },
         {
             "name": "!restart",
