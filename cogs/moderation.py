@@ -129,7 +129,8 @@ class Moderation(commands.Cog):
                                     msg = f"👴 {member.mention} just misclicked into `{before.channel.name}`! (Total misclicks: {current_count})"
 
                                 await general_channel.send(msg)
-                                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {msg}")
+                                log_msg = msg.replace(member.mention, member.name)
+                                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
 
                         except discord.Forbidden:
                             print(f"⚠️ Could not manage unc roles for {member.name}: The bot lacks permissions or the role hierarchy is incorrect.")
@@ -198,7 +199,7 @@ class Moderation(commands.Cog):
         # Apply the changes all at once
         await member.edit(roles=new_roles, reason="Sent to Rada's Prison Island")
         await ctx.send(f"🔒 {member.mention} has been sent to **Rada’s Prison Island**.")
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔒 {member.mention} has been sent to **Rada’s Prison Island**.")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔒 {member.name} has been sent to Rada’s Prison Island.")
 
     @commands.command(name="release")
     @commands.has_permissions(manage_roles=True)
@@ -231,7 +232,7 @@ class Moderation(commands.Cog):
 
         await member.edit(roles=roles_to_restore, reason="Released from Rada's Prison Island")
         await ctx.send(f"✅ {member.mention} has been released from **Rada’s Prison Island**.")
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.mention} has been released from **Rada’s Prison Island**.")
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.name} has been released from Rada’s Prison Island.")
 
     # ---------------------------------------------------------
     # EVASION PREVENTION (Rejoining Inmates)
