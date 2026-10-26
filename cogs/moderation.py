@@ -36,6 +36,20 @@ class Moderation(commands.Cog):
             with open(self.unc_file, "w") as f:
                 json.dump({}, f)
 
+        # Trust System Configuration (Media Permissions)
+        self.trusted_role_id = 1564076419338735686
+        self.trust_file = "trust_data.json"
+        self.trust_cooldowns = {}
+        self.trust_threshold = 30  # Number of valid interactions required
+        self.trust_cooldown_seconds = 60  # Cooldown between counted messages
+
+        # Async lock to prevent file corruption and race conditions
+        self.trust_lock = asyncio.Lock()
+
+        if not os.path.exists(self.trust_file):
+            with open(self.trust_file, "w") as f:
+                json.dump({}, f)
+
     def load_unc_data(self):
         try:
             with open(self.unc_file, "r") as f:
@@ -272,6 +286,70 @@ class Moderation(commands.Cog):
                 )
                 print(f"Successfully announced prison evasion for {member.name}.")
                 
+    def load_trust_data(self):
+        try:
+            with open(self.trust_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+    def save_trust_data(self, data):
+        with open(self.trust_file, "w") as f:
+            json.dump(data, f, indent=4)
+
+    # ---------------------------------------------------------
+    # TRUST SYSTEM (Anti-Raid Media Permissions)
+    # ---------------------------------------------------------
+    @commands.Cog.listener()
+    async def on_message(self, message):
+        if message.author.bot or not message.guild:
+            return
+
+        # 1. Ignore users who already have the role
+        if any(role.id == self.trusted_role_id for role in message.author.roles):
+            return
+
+        # 2. Check the anti-spam cooldown buffer
+        now = datetime.now()
+        last_interaction = self.trust_cooldowns.get(message.author.id)
+        
+        if last_interaction and (now - last_interaction).total_seconds() < self.trust_cooldown_seconds:
+            return # Too soon, silently ignore
+
+        # Update their cooldown timer
+        self.trust_cooldowns[message.author.id] = now
+
+        # 3. safely lock the file operations to prevent race conditions
+        async with self.trust_lock:
+            trust_data = self.load_trust_data()
+            uid = str(message.author.id)
+            current_points = trust_data.get(uid, 0) + 1
+            
+            # 4. Check if they reached the threshold
+            if current_points >= self.trust_threshold:
+                trusted_role = message.guild.get_role(self.trusted_role_id)
+                if trusted_role:
+                    try:
+                        await message.author.add_roles(trusted_role, reason="Reached interaction threshold for media permissions.")
+                        
+                        # Clean up the JSON ledger to save space since they now have the role
+                        if uid in trust_data:
+                            del trust_data[uid]
+                        self.save_trust_data(trust_data)
+
+                        # Silently DM the user to let them know
+                        try:
+                            await message.author.send(f"🎉 **Access Granted!** Thanks for chatting in **{message.guild.name}**. You've interacted enough to unlock media permissions—you can now attach files and embed links!")
+                        except discord.Forbidden:
+                            pass
+                            
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Awarded Trusted Media role to {message.author.name}")
+                    except discord.Forbidden:
+                        print(f"⚠️ Could not assign Trusted Media role to {message.author.name}: Bot lacks permissions.")
+            else:
+                # Save progress if they haven't reached the threshold yet
+                trust_data[uid] = current_points
+                self.save_trust_data(trust_data)
 
 async def setup(bot):
     await bot.add_cog(Moderation(bot))

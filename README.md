@@ -8,6 +8,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Persistent Prison (`!prison @user` / `!release @user`)**: Strips a user's roles (preserving safe category roles), saves their exact role state to a local ledger (`prison_data.json`), and assigns the Inmate role. Releasing the user automatically restores their original roles.
 - **Evasion Prevention**: If an imprisoned user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, throws them back into prison, and announces the evasion attempt in the general channel.
 - **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within 3 seconds) and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently via `unc_data.json`, protected by a 1-hour anti-spam buffer zone.
+- **Trust System (Anti-Raid)**: Protects the server by automatically awarding a "Trusted Media" role once a user reaches 30 valid chat interactions. Features a 60-second cooldown between counted messages to prevent spamming, ensuring the role is only granted after genuine, sustained engagement.
 
 ### 📈 Analytics
 *Note: Scrapes message history to track server activity over time. Excludes channels ending in `logs`.*
@@ -53,7 +54,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 
 3. **Discord Portal Configuration:**
    - Enable **Message Content Intent** and **Server Members Intent** in the Discord Developer Portal.
-   - Ensure the bot's highest role is placed **above** the Inmate role, Unc roles, and any user roles it needs to manage to prevent `403 Forbidden` errors.
+   - Ensure the bot's highest role is placed **above** the Inmate role, Unc roles, the Trusted Media role, and any user roles it needs to manage to prevent `403 Forbidden` errors.
    - Ensure the bot has the **Manage Roles** permission.
 
 4. **Run the Bot:**
