@@ -17,6 +17,7 @@ class Moderation(commands.Cog):
         # Prison System Configuration
         self.prison_file = "prison_data.json"
         self.inmate_role_id = 1351480622497009685
+        self.quarantine_role_id = 1565014017481646092
         self.staff_role_ids = [818263287716249601, 1236070091431608320, 1352345807604551761]
         self.category_role_ids = [
             1562090532002332754, 1562089458168242258, 1562090734713176145, 
@@ -249,22 +250,53 @@ class Moderation(commands.Cog):
         print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.name} has been released from Rada’s Prison Island.")
 
     # ---------------------------------------------------------
-    # EVASION PREVENTION (Rejoining Inmates)
+    # ONBOARDING, EVASION PREVENTION & QUARANTINE
     # ---------------------------------------------------------
     @commands.Cog.listener()
     async def on_member_join(self, member):
-        data = self.load_prison_data()
-        
-        if str(member.id) in data:
-            # Wait 3 seconds to let Discord Onboarding and Circle Bot finish giving them roles
-            await asyncio.sleep(3)
-            
-            # Fetch the freshest version of the member to get the roles they just acquired
-            member = member.guild.get_member(member.id)
-            if not member: 
-                return
+        # 1. Wait for Discord Onboarding and Circle Bot to finish assigning initial roles
+        await asyncio.sleep(3)
+        member = member.guild.get_member(member.id)
+        if not member: 
+            return
 
-            # Re-apply the prison lockdown
+        # 2. Check Conditions
+        quarantine_days = int(os.getenv("QUARANTINE_ACCOUNT_AGE_DAYS", "7"))
+        account_age = discord.utils.utcnow() - member.created_at
+        needs_quarantine = account_age.days <= quarantine_days
+        
+        data = self.load_prison_data()
+        uid = str(member.id)
+        is_inmate = uid in data
+
+        # 3. Handle Quarantine Priority (Overrides Prison)
+        if needs_quarantine:
+            
+            # Wipe prison data to revoke visitor list access
+            if is_inmate:
+                del data[uid]
+                self.save_prison_data(data)
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Cleared prison data for {member.name} to enforce strict quarantine.")
+
+            # Keep protected category roles assigned by Carl-bot
+            new_roles = []
+            for role in member.roles:
+                if role.id in self.category_role_ids:
+                    new_roles.append(role)
+
+            # Assign the quarantine role
+            q_role = member.guild.get_role(self.quarantine_role_id)
+            if q_role:
+                new_roles.append(q_role)
+                
+            try:
+                await member.edit(roles=new_roles, reason=f"Account auto-quarantined. Age: {account_age.days} days.")
+                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto-quarantined and role-wiped new account {member.name} (Age: {account_age.days} days).")
+            except discord.Forbidden:
+                print(f"⚠️ Could not wipe and assign Quarantine role to {member.name}: Bot lacks permissions.")
+
+        # 4. Handle Standard Prison Lockdown (Only if they are NOT quarantined)
+        elif is_inmate:
             new_roles = []
             for role in member.roles:
                 if role.id in self.category_role_ids:
@@ -274,28 +306,78 @@ class Moderation(commands.Cog):
             if inmate_role:
                 new_roles.append(inmate_role)
             
-            # Strip unauthorized roles
-            await member.edit(roles=new_roles, reason="Fleeing inmate rejoined. Sent back to prison.")
+            try:
+                await member.edit(roles=new_roles, reason="Fleeing inmate rejoined. Sent back to prison.")
+                general_channel = discord.utils.get(member.guild.text_channels, name="general")
+                if general_channel:
+                    await general_channel.send(
+                        f"🚨 **Prison Evasion Attempted!** {member.mention} tried to flee the server and rejoin to clear their roles, "
+                        f"but Gate Greeter immediately dragged them back to **Rada’s Prison Island**."
+                    )
+            except discord.Forbidden:
+                print(f"⚠️ Could not lock down {member.name}: Bot lacks permissions.")
 
-            # Announce the evasion attempt in general chat
-            general_channel = discord.utils.get(member.guild.text_channels, name="general")
-            if general_channel:
-                await general_channel.send(
-                    f"🚨 **Prison Evasion Attempted!** {member.mention} tried to flee the server and rejoin to clear their roles, "
-                    f"but Gate Greeter immediately dragged them back to **Rada’s Prison Island**."
-                )
-                print(f"Successfully announced prison evasion for {member.name}.")
+    # ---------------------------------------------------------
+    # STRICT ROLE ENFORCEMENT (Onboarding Bypass Prevention)
+    # ---------------------------------------------------------
+    @commands.Cog.listener()
+    async def on_member_update(self, before, after):
+        # Only trigger if their roles actually changed
+        if before.roles == after.roles:
+            return
+
+        # RAM-only checks (Zero disk I/O)
+        is_quarantined = any(r.id == self.quarantine_role_id for r in after.roles)
+        is_inmate = any(r.id == self.inmate_role_id for r in after.roles)
+
+        # If they are a normal user, let them change roles freely
+        if not is_quarantined and not is_inmate:
+            return
+
+        # 1. Enforce Quarantine (Strict: ONLY Quarantine + Category Roles)
+        if is_quarantined:
+            q_role = after.guild.get_role(self.quarantine_role_id)
+            valid_roles = []
+            if q_role:
+                valid_roles.append(q_role)
                 
-    def load_trust_data(self):
-        try:
-            with open(self.trust_file, "r") as f:
-                return json.load(f)
-        except (json.JSONDecodeError, FileNotFoundError):
-            return {}
+            # Allow them to keep protected category roles
+            for role in after.roles:
+                if role.id in self.category_role_ids:
+                    valid_roles.append(role)
+                    
+            # Check if they acquired any roles outside of Quarantine + Categories
+            current_roles = [r for r in after.roles if r.id != after.guild.default_role.id]
+            
+            if set(r.id for r in current_roles) != set(r.id for r in valid_roles):
+                try:
+                    await after.edit(roles=valid_roles, reason="Strict Quarantine Enforcement: Prevented role self-assignment.")
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from quarantined user {after.name}.")
+                except discord.Forbidden:
+                    pass
+            return # Stop here so quarantine takes absolute priority
 
-    def save_trust_data(self, data):
-        with open(self.trust_file, "w") as f:
-            json.dump(data, f, indent=4)
+        # 2. Enforce Prison (Strict: ONLY Inmate + Category Roles)
+        if is_inmate:
+            inmate_role = after.guild.get_role(self.inmate_role_id)
+            valid_roles = []
+            if inmate_role:
+                valid_roles.append(inmate_role)
+                
+            # Allow them to keep protected category roles
+            for role in after.roles:
+                if role.id in self.category_role_ids:
+                    valid_roles.append(role)
+                    
+            # Check if they acquired any roles outside of Inmate + Categories
+            current_roles = [r for r in after.roles if r.id != after.guild.default_role.id]
+            
+            if set(r.id for r in current_roles) != set(r.id for r in valid_roles):
+                try:
+                    await after.edit(roles=valid_roles, reason="Strict Prison Enforcement: Prevented role self-assignment.")
+                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from imprisoned user {after.name}.")
+                except discord.Forbidden:
+                    pass
 
     # ---------------------------------------------------------
     # TRUST SYSTEM (Anti-Raid Media Permissions)
