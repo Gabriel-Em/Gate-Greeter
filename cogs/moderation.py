@@ -18,6 +18,7 @@ class Moderation(commands.Cog):
         self.prison_file = "prison_data.json"
         self.inmate_role_id = 1351480622497009685
         self.quarantine_role_id = 1565014017481646092
+        self.quarantine_logs_channel_id = 1565018638614925322
         self.staff_role_ids = [818263287716249601, 1236070091431608320, 1352345807604551761]
         self.category_role_ids = [
             1562090532002332754, 1562089458168242258, 1562090734713176145, 
@@ -291,6 +292,12 @@ class Moderation(commands.Cog):
                 
             try:
                 await member.edit(roles=new_roles, reason=f"Account auto-quarantined. Age: {account_age.days} days.")
+                log_channel = member.guild.get_channel(self.quarantine_logs_channel_id)
+                if log_channel:
+                    await log_channel.send(
+                        f"🔒 **Auto-Quarantine:** {member.mention} has been quarantined upon joining. "
+                        f"Account age: **{account_age.days} days**."
+                    )
                 print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Auto-quarantined and role-wiped new account {member.name} (Age: {account_age.days} days).")
             except discord.Forbidden:
                 print(f"⚠️ Could not wipe and assign Quarantine role to {member.name}: Bot lacks permissions.")
