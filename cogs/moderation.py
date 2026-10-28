@@ -26,6 +26,9 @@ class Moderation(commands.Cog):
             1562092243928481882, 1562097073266888824
         ]
 
+        self.channel_deletions = {}
+        self.mods_chat_id = 818281727331794974
+    
         # Initialize the prison ledger if it doesn't exist
         if not os.path.exists(self.prison_file):
             with open(self.prison_file, "w") as f:
@@ -450,6 +453,79 @@ class Moderation(commands.Cog):
                 # Save progress if they haven't reached the threshold yet
                 trust_data[uid] = current_points
                 self.save_trust_data(trust_data)
+
+    # ---------------------------------------------------------
+    # ANTI-NUKE SYSTEM (Channel Deletion Limits)
+    # ---------------------------------------------------------
+    @commands.Cog.listener()
+    async def on_guild_channel_delete(self, channel):
+        guild = channel.guild
+        
+        # Wait 2 seconds to ensure the Discord Audit Log has registered the event
+        await asyncio.sleep(2)
+        
+        deleter = None
+        # Fetch the most recent channel deletion log
+        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
+            if entry.target.id == channel.id:
+                deleter = entry.user
+                break
+                
+        # If we couldn't find the user (e.g., Discord API lag), ignore it
+        if not deleter:
+            return
+            
+        user_id = deleter.id
+        now = datetime.now()
+        
+        # Initialize their record if they don't have one
+        if user_id not in self.channel_deletions:
+            self.channel_deletions[user_id] = []
+            
+        self.channel_deletions[user_id].append(now)
+        
+        # Filter the list to only include deletions from the last 10 minutes (600 seconds)
+        recent_deletions = [t for t in self.channel_deletions[user_id] if (now - t).total_seconds() <= 600]
+        self.channel_deletions[user_id] = recent_deletions
+        
+        # If they hit the threshold of 2 channels
+        if len(recent_deletions) >= 2:
+            member = guild.get_member(user_id)
+            if member:
+                # Clear their history immediately so it doesn't trigger repeatedly while processing
+                del self.channel_deletions[user_id]
+                mods_chat = guild.get_channel(self.mods_chat_id)
+                
+                if member.bot:
+                    # BOT ACTION: Kick the bot completely
+                    try:
+                        await member.kick(reason="Anti-Nuke: Rogue bot deleted 2 channels within 10 minutes.")
+                        if mods_chat:
+                            await mods_chat.send(
+                                f"🚨 **ANTI-NUKE LOCKDOWN TRIGGERED!** 🚨\n"
+                                f"The bot {member.mention} just deleted 2 channels within a 10-minute window. "
+                                f"Gate Greeter has **kicked** the bot from the server to stop the attack."
+                            )
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Anti-nuke: Kicked rogue bot {member.name}.")
+                    except discord.Forbidden:
+                        print(f"⚠️ Anti-nuke failed to kick bot {member.name}: Gate Greeter's role is too low.")
+                        if mods_chat:
+                            await mods_chat.send(f"⚠️ **URGENT:** The bot {member.mention} is deleting channels, but my role is too low to kick it!")
+                else:
+                    # HUMAN ACTION: Strip all roles
+                    try:
+                        await member.edit(roles=[], reason="Anti-Nuke: Deleted 2 channels within 10 minutes.")
+                        if mods_chat:
+                            await mods_chat.send(
+                                f"🚨 **ANTI-NUKE LOCKDOWN TRIGGERED!** 🚨\n"
+                                f"The user {member.mention} just deleted 2 channels within a 10-minute window. "
+                                f"Gate Greeter has **stripped all of their roles** to prevent further damage."
+                            )
+                        print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Anti-nuke: Stripped all roles from {member.name}.")
+                    except discord.Forbidden:
+                        print(f"⚠️ Anti-nuke failed to strip {member.name}: Gate Greeter's role is too low.")
+                        if mods_chat:
+                            await mods_chat.send(f"⚠️ **URGENT:** The user {member.mention} is deleting channels, but my role is too low to strip their permissions!")
 
 async def setup(bot):
     await bot.add_cog(Moderation(bot))
