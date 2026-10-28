@@ -379,6 +379,17 @@ class Moderation(commands.Cog):
                 except discord.Forbidden:
                     pass
 
+    def load_trust_data(self):
+        try:
+            with open(self.trust_file, "r") as f:
+                return json.load(f)
+        except (json.JSONDecodeError, FileNotFoundError):
+            return {}
+
+    def save_trust_data(self, data):
+        with open(self.trust_file, "w") as f:
+            json.dump(data, f, indent=4)
+
     # ---------------------------------------------------------
     # TRUST SYSTEM (Anti-Raid Media Permissions)
     # ---------------------------------------------------------
