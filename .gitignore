@@ -222,6 +222,7 @@ __marimo__/
 
 # Bot Generated Data
 monthly_stats/
+backups/
 prison_data.json
 unc_data.json
 trust_data.json

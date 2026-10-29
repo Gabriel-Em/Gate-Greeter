@@ -14,6 +14,14 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions (`trust_data.json`). Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
 - **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
 
+### 🗂️ Server Backup & Snapshot
+- **Server Structure Snapshot (`!snapshot`)**: Captures the complete structural state of the server—including server settings, roles (hierarchy order, colors, hoist/mentionable flags, and permissions), categories, and channels (text, voice, stage, forum, announcement settings, and role permission overwrites).
+- **Dual Machine & Human-Readable Formats**:
+  - `backups/server_snapshot.json`: Stores raw IDs, integer colors, and permission bitfields ready for an automated `!restore` workflow alongside decoded permission names.
+  - `backups/server_snapshot.md`: Generates a formatted Markdown recovery manual with tables and lists so admins can manually rebuild any part of the server without needing the bot.
+  - Both files are saved locally in `backups/` and attached directly to the Discord response.
+- **Strict Zero-User-Data Policy**: Never stores messages, member lists, or user-specific channel overwrites (only `discord.Role` overwrites are recorded).
+
 ### 📈 Analytics
 *Note: Scrapes message history to track server activity over time. Excludes channels ending in `logs`.*
 - **`!topusers [year] <month>`**: Shows the top 10 most active members for a given year or specific month, caching data locally in `monthly_stats/` for speed.
@@ -44,6 +52,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    ENABLE_ANALYTICS=True
    ENABLE_AUTO_RESPONDER=True
    ENABLE_MODERATION=True
+   ENABLE_BACKUP=True
 
    # Granular Analytics Commands
    ENABLE_CMD_ARCHIVE=True
@@ -57,6 +66,9 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 
    # Moderation Commands
    ENABLE_CMD_PRISON=True
+
+   # Backup Commands
+   ENABLE_CMD_SNAPSHOT=True
 
    # Moderation Thresholds & Timers
    QUARANTINE_ACCOUNT_AGE_DAYS=7
@@ -94,7 +106,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 3. **Discord Portal Configuration:**
    - Enable **Message Content Intent** and **Server Members Intent** in the Discord Developer Portal.
    - Ensure the bot's highest role is placed **above** the Inmate role, Quarantine role, Unc roles, the Trusted Media role, and any user/bot roles it needs to manage to prevent `403 Forbidden` errors.
-   - Ensure the bot has the **Manage Roles**, **Kick Members**, and **View Audit Log** permissions.
+   - Ensure the bot has the **Manage Roles**, **Kick Members**, and **View Audit Log** permissions (and temporarily grant **Administrator** when running `!snapshot` if you want to ensure hidden staff/private channels are captured without adding the bot to each channel).
 
 4. **Run the Bot:**
    ```bash

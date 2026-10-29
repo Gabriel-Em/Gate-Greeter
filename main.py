@@ -30,6 +30,10 @@ async def load_extensions():
         await bot.load_extension("cogs.moderation")
         print("Loaded module: Moderation")
 
+    if is_env_enabled("ENABLE_BACKUP"):
+        await bot.load_extension("cogs.backup")
+        print("Loaded module: Backup")
+
 
 @bot.event
 async def setup_hook():
@@ -96,7 +100,9 @@ async def help_command(ctx):
 
     analytics_enabled = is_env_enabled("ENABLE_ANALYTICS")
     moderation_enabled = is_env_enabled("ENABLE_MODERATION")
+    backup_enabled = is_env_enabled("ENABLE_BACKUP")
     prison_active = moderation_enabled and is_env_enabled("ENABLE_CMD_PRISON")
+    snapshot_active = backup_enabled and is_env_enabled("ENABLE_CMD_SNAPSHOT")
     active_msg_threshold = get_env_int("PRONOUN_ACTIVE_MSG_THRESHOLD", 50)
 
     commands_info = [
@@ -129,6 +135,11 @@ async def help_command(ctx):
             "name": "!release @user",
             "desc": "Releases an inmate and restores all their previous roles.",
             "active": prison_active,
+        },
+        {
+            "name": "!snapshot",
+            "desc": "Exports a full server structure backup (roles, channels, permissions) in JSON and Markdown (Admin only).",
+            "active": snapshot_active,
         },
         {
             "name": "!restart",
