@@ -222,4 +222,6 @@ __marimo__/
 
 # Bot Generated Data
 monthly_stats/
-greeted_users.txt
+prison_data.json
+unc_data.json
+trust_data.json
