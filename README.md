@@ -32,7 +32,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 ### 🧠 Stateless Two-Pass LLM Assistant (`!ask` & `!optout`)
 - **Two-Pass LLM Pipeline (`!ask [question]`)**:
   - **Pass 1 (The Router)**: Uses a fast Gemini model (`LLM_ROUTER_MODEL`, default `gemini-3.5-flash-lite`) with structured JSON output to determine whether the query requires channel context or is a standalone question, extracting an optimized question and any target usernames.
-  - **Conditional Context Fetching**: When context is required, fetches up to `LLM_HISTORY_FETCH_LIMIT` (default 500) of the most recent channel messages, filtering to target participants if specified while excluding opted-out users.
+  - **Conditional Context Fetching**: When context is required, fetches up to `LLM_HISTORY_FETCH_LIMIT` (default 300) of the most recent channel messages, filtering to target participants if specified while excluding opted-out users.
   - **Pass 2 (The Synthesizer)**: Sends the combined intent, optimized question, privacy opt-out notices, and filtered chat history to the primary Gemini model (`LLM_SYNTHESIZER_MODEL`, default `gemini-3.8-flash`) in a completely stateless call.
 - **Per-User Rate Limiting**: Restricts usage to `LLM_RATE_LIMIT_COUNT` requests (default 2) per `LLM_RATE_LIMIT_HOURS` window (default 24 hours), persisted in `llm_cooldowns.json`, and displays the exact remaining time (`hours, minutes, seconds`) when on cooldown.
 - **Privacy Opt-Out (`!optout`)**: Allows any user to toggle their opt-out status (`llm_optout.json`). Messages from opted-out users are completely ignored during context fetching, and Pass 2 is explicitly informed that messages from those users are unavailable due to opt-out.
@@ -87,7 +87,8 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    LLM_SYNTHESIZER_MODEL=gemini-3.8-flash
    LLM_RATE_LIMIT_COUNT=2
    LLM_RATE_LIMIT_HOURS=24
-   LLM_HISTORY_FETCH_LIMIT=500
+   LLM_HISTORY_FETCH_LIMIT=300
+   LLM_REQUEST_TIMEOUT_SECONDS=120
 
    # Moderation Thresholds & Timers
    QUARANTINE_ACCOUNT_AGE_DAYS=7

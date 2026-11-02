@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 from pydantic import BaseModel, Field
 from google import genai
 from google.genai import types, errors
+import httpx
 import discord
 from discord.ext import commands
 
@@ -72,7 +73,8 @@ class LLM(commands.Cog):
         # Load Configurable Constants from Environment
         self.rate_limit_count = get_env_int("LLM_RATE_LIMIT_COUNT", 2)
         self.rate_limit_hours = get_env_int("LLM_RATE_LIMIT_HOURS", 24)
-        self.history_fetch_limit = get_env_int("LLM_HISTORY_FETCH_LIMIT", 500)
+        self.history_fetch_limit = get_env_int("LLM_HISTORY_FETCH_LIMIT", 300)
+        self.request_timeout_seconds = get_env_int("LLM_REQUEST_TIMEOUT_SECONDS", 120)
 
         self.router_model = os.getenv("LLM_ROUTER_MODEL", "gemini-3.5-flash-lite").strip()
         self.synthesizer_model = os.getenv("LLM_SYNTHESIZER_MODEL", "gemini-3.8-flash").strip()
@@ -84,12 +86,17 @@ class LLM(commands.Cog):
     # ---------------------------------------------------------
     # INTERNAL HELPERS
     # ---------------------------------------------------------
-    @staticmethod
-    def _get_genai_client() -> genai.Client:
+    def _get_genai_client(self) -> genai.Client:
         api_key = os.getenv("GEMINI_API_KEY", "").strip()
         if not api_key:
             raise ValueError("GEMINI_API_KEY is not configured in `.env`.")
-        return genai.Client(api_key=api_key)
+        return genai.Client(
+            api_key=api_key,
+            http_options=types.HttpOptions(
+                timeout=self.request_timeout_seconds * 1000,
+                retry_options=types.HttpRetryOptions(attempts=2),
+            ),
+        )
 
     @staticmethod
     def _validate_response_safety(response: types.GenerateContentResponse) -> None:
@@ -453,7 +460,13 @@ class LLM(commands.Cog):
             client = self._get_genai_client()
 
             # 2. Pass 1: The Router (Intent & Safety Check)
-            router_output = await self._route_query(client, clean_query)
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔍 [Pass 1] Routing !ask query from {ctx.author} using {self.router_model}..."
+            )
+            router_output = await asyncio.wait_for(
+                self._route_query(client, clean_query),
+                timeout=self.request_timeout_seconds,
+            )
 
             # Halt Pipeline Immediately if Router Flags Request as Unsafe
             if not router_output.is_safe:
@@ -468,6 +481,9 @@ class LLM(commands.Cog):
             chat_lines = []
             opted_out_names = []
             if router_output.needs_context:
+                print(
+                    f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 📜 Fetching up to {self.history_fetch_limit} messages for {ctx.author} (targets={router_output.target_usernames})..."
+                )
                 await status_msg.edit(
                     content=f"📜 Fetching up to {self.history_fetch_limit} recent messages from channel history..."
                 )
@@ -476,13 +492,19 @@ class LLM(commands.Cog):
                 )
 
             # 4. Pass 2: The Synthesizer
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🧠 [Pass 2] Synthesizing response for {ctx.author} using {self.synthesizer_model} ({len(chat_lines)} context msgs)..."
+            )
             await status_msg.edit(content="🧠 Synthesizing response...")
-            answer = await self._synthesize_response(
-                client,
-                clean_query,
-                router_output,
-                chat_lines,
-                opted_out_names,
+            answer = await asyncio.wait_for(
+                self._synthesize_response(
+                    client,
+                    clean_query,
+                    router_output,
+                    chat_lines,
+                    opted_out_names,
+                ),
+                timeout=self.request_timeout_seconds,
             )
 
             # Record usage only after a successful LLM pipeline execution
@@ -500,6 +522,17 @@ class LLM(commands.Cog):
             await ctx.reply(SAFETY_REJECTION_MESSAGE, ephemeral=True)
             print(
                 f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🛡️ Blocked !ask query from {ctx.author} (SDK Safety Exception)."
+            )
+            return
+
+        except (asyncio.TimeoutError, httpx.TimeoutException):
+            await status_msg.delete()
+            await ctx.reply(
+                f"⏱️ **Request Timed Out:** The AI model took longer than **{self.request_timeout_seconds} seconds** to respond. "
+                f"Your request did **not** count toward your rate limit—please try again later!"
+            )
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⏱️ !ask query from {ctx.author} timed out after {self.request_timeout_seconds}s."
             )
             return
 
