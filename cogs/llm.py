@@ -503,6 +503,34 @@ class LLM(commands.Cog):
             )
             return
 
+        except errors.ServerError as e:
+            await status_msg.delete()
+            await ctx.reply(
+                "⚠️ **AI Service Temporarily Busy:** The model is currently experiencing high demand. "
+                "Your request did **not** count toward your rate limit—please try again in a moment!"
+            )
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Gemini ServerError ({e.code}) for {ctx.author}: {e.message}"
+            )
+            return
+
+        except errors.APIError as e:
+            await status_msg.delete()
+            if e.code == 429:
+                await ctx.reply(
+                    "⏳ **AI API Quota Reached:** The bot's Gemini API rate limit is temporarily saturated. "
+                    "Your request did **not** count toward your personal limit—please try again shortly!"
+                )
+            else:
+                await ctx.reply(
+                    "⚠️ **AI Service Error:** An unexpected error occurred while communicating with the AI provider. "
+                    "Your request did **not** count toward your rate limit."
+                )
+            print(
+                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚠️ Gemini APIError ({e.code}) for {ctx.author}: {e.message}"
+            )
+            return
+
         except Exception as e:
             await status_msg.delete()
             raise e
