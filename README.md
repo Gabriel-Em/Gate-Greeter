@@ -29,6 +29,14 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **`!archive`**: Deep scans and archives message counts for the past 12 months.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
 
+### 🧠 Stateless Two-Pass LLM Assistant (`!ask` & `!optout`)
+- **Two-Pass LLM Pipeline (`!ask [question]`)**:
+  - **Pass 1 (The Router)**: Uses a fast Gemini model (`LLM_ROUTER_MODEL`, default `gemini-3.5-flash-lite`) with structured JSON output to determine whether the query requires channel context or is a standalone question, extracting an optimized question and any target usernames.
+  - **Conditional Context Fetching**: When context is required, fetches up to `LLM_HISTORY_FETCH_LIMIT` (default 500) of the most recent channel messages, filtering to target participants if specified while excluding opted-out users.
+  - **Pass 2 (The Synthesizer)**: Sends the combined intent, optimized question, privacy opt-out notices, and filtered chat history to the primary Gemini model (`LLM_SYNTHESIZER_MODEL`, default `gemini-3.8-flash`) in a completely stateless call.
+- **Per-User Rate Limiting**: Restricts usage to `LLM_RATE_LIMIT_COUNT` requests (default 2) per `LLM_RATE_LIMIT_HOURS` window (default 24 hours), persisted in `llm_cooldowns.json`, and displays the exact remaining time (`hours, minutes, seconds`) when on cooldown.
+- **Privacy Opt-Out (`!optout`)**: Allows any user to toggle their opt-out status (`llm_optout.json`). Messages from opted-out users are completely ignored during context fetching, and Pass 2 is explicitly informed that messages from those users are unavailable due to opt-out.
+
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
 - **Dynamic Help (`!help`)**: A custom embed help command that displays all available commands, their arguments, and whether they are currently `Active` or `Disabled` based on the `.env` configuration.
@@ -53,6 +61,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    ENABLE_AUTO_RESPONDER=True
    ENABLE_MODERATION=True
    ENABLE_BACKUP=True
+   ENABLE_LLM=True
 
    # Granular Analytics Commands
    ENABLE_CMD_ARCHIVE=True
@@ -69,6 +78,16 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 
    # Backup Commands
    ENABLE_CMD_SNAPSHOT=True
+
+   # LLM Commands & Configuration
+   ENABLE_CMD_ASK=True
+   ENABLE_CMD_OPTOUT=True
+   GEMINI_API_KEY=your_gemini_api_key_here
+   LLM_ROUTER_MODEL=gemini-3.5-flash-lite
+   LLM_SYNTHESIZER_MODEL=gemini-3.8-flash
+   LLM_RATE_LIMIT_COUNT=2
+   LLM_RATE_LIMIT_HOURS=24
+   LLM_HISTORY_FETCH_LIMIT=500
 
    # Moderation Thresholds & Timers
    QUARANTINE_ACCOUNT_AGE_DAYS=7

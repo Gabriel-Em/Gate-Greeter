@@ -205,6 +205,7 @@ cython_debug/
 # .vscode/
 # Temporary file for partial code execution
 tempCodeRunnerFile.py
+settings.json
 
 # Ruff stuff:
 .ruff_cache/
@@ -226,3 +227,5 @@ backups/
 prison_data.json
 unc_data.json
 trust_data.json
+llm_optout.json
+llm_cooldowns.json
