@@ -134,6 +134,11 @@ async def help_command(ctx):
             "active": prison_active,
         },
         {
+            "name": "!quarantine @user <reason>",
+            "desc": "Strips a user's roles (except categories), saves them, and drags them to Quarantine (Staff only).",
+            "active": moderation_enabled,
+        },
+        {
             "name": "!release @user (or !unquarantine @user)",
             "desc": "Releases a quarantined user or prison inmate into the wild and restores their previous roles.",
             "active": moderation_enabled,

@@ -262,6 +262,14 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         announcement = self.quarantine_channel.send.call_args.args[0]
         self.assertIn(member.mention, announcement)
         self.assertIn("released into the wild", announcement)
+        self.assertNotIn(staff.mention, announcement)
+        self.assertNotIn(staff.name, announcement)
+
+        # Quarantine log sent without tagging releaser
+        self.quarantine_logs_channel.send.assert_awaited()
+        log_content = self.quarantine_logs_channel.send.call_args.args[0]
+        self.assertIn(f"by **{staff.display_name}**", log_content)
+        self.assertNotIn(staff.mention, log_content)
 
     async def test_release_quarantined_account_age_does_not_restore_partial_roles(self):
         """Releasing an account_age quarantined user does NOT restore partial onboarding roles and directs to Channels & Roles via DM."""
@@ -355,13 +363,57 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         interaction.channel.send = AsyncMock()
         interaction.message = MagicMock()
         interaction.message.edit = AsyncMock()
+        interaction.message.reply = AsyncMock()
+        interaction.message.channel = interaction.channel
 
         await button.callback(interaction)
 
-        interaction.response.defer.assert_awaited_once()
+        interaction.response.defer.assert_awaited_once_with(ephemeral=True)
         member.edit.assert_awaited_once()
-        interaction.followup.send.assert_awaited_once()
+        interaction.message.reply.assert_awaited_once()
+        reply_content = interaction.message.reply.call_args.args[0]
+        self.assertIn(member.mention, reply_content)
+        self.assertNotIn(interaction.user.mention, reply_content)
+        self.assertNotIn(interaction.user.name, reply_content)
+        interaction.followup.send.assert_awaited_once_with(f"✅ Released {member.name} into the wild.", ephemeral=True)
         self.assertTrue(button.item.disabled)
+
+    async def test_manual_quarantine_command(self):
+        """Staff manually quarantining a user saves roles, tags user with manual explanation, and logs with untagged staff name."""
+        member = self._create_member(
+            user_id=12345,
+            name="TargetUser",
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role, self.user_role1],
+        )
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx = MagicMock()
+        ctx.author = staff
+        ctx.send = AsyncMock()
+
+        await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Testing manual quarantine")
+
+        # Roles stripped and saved
+        member.edit.assert_awaited_once()
+        q_data = load_json_data(self.test_q_file)
+        self.assertIn(str(member.id), q_data)
+        self.assertEqual(q_data[str(member.id)]["type"], "manual")
+
+        # Message in quarantine channel mentions user and states placed by staff, NOT account too new
+        self.quarantine_channel.send.assert_awaited_once()
+        q_msg = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn(member.mention, q_msg)
+        self.assertIn("placed in quarantine by staff", q_msg)
+        self.assertNotIn("too new", q_msg)
+        self.assertIn("Testing manual quarantine", q_msg)
+
+        # Log in quarantine logs channel states manual quarantine with bold name, no staff tag
+        self.quarantine_logs_channel.send.assert_awaited_once()
+        log_msg = self.quarantine_logs_channel.send.call_args.args[0]
+        self.assertIn("Manual Quarantine:", log_msg)
+        self.assertIn(f"by **{staff.display_name}**", log_msg)
+        self.assertNotIn(staff.mention, log_msg)
+        self.assertNotIn("Auto-Quarantine:", log_msg)
 
     async def test_release_button_click_by_non_staff_denied(self):
         """Non-staff clicking the release button gets rejected."""

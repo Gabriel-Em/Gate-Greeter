@@ -68,9 +68,14 @@ class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], templat
             except (discord.NotFound, discord.HTTPException):
                 return await interaction.response.send_message("⚠️ Member is no longer in this server.", ephemeral=True)
 
-        await interaction.response.defer()
+        await interaction.response.defer(ephemeral=True)
 
-        success, msg = await cog.release_quarantined_member(member, released_by=interaction.user, channel=interaction.channel)
+        success, msg = await cog.release_quarantined_member(
+            member,
+            released_by=interaction.user,
+            channel=interaction.channel,
+            reply_to=interaction.message,
+        )
 
         if success:
             # Disable button and update label on message
@@ -87,7 +92,7 @@ class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], templat
                 await interaction.message.edit(view=target_view)
             except Exception:
                 pass
-            await interaction.followup.send(f"🌿 {member.mention} has been released into the wild by {interaction.user.mention}!")
+            await interaction.followup.send(f"✅ Released {member.name} into the wild.", ephemeral=True)
         else:
             await interaction.followup.send(f"⚠️ {msg}", ephemeral=True)
 
@@ -339,6 +344,7 @@ class Moderation(commands.Cog):
         automod_details: dict | None = None,
         is_evasion: bool = False,
         quarantine_type: str | None = None,
+        quarantined_by: discord.Member | discord.User | None = None,
     ) -> bool:
         """Quarantines a member, saves their prior roles, and announces it with a release button."""
         if member.bot:
@@ -377,6 +383,8 @@ class Moderation(commands.Cog):
                     "type": effective_type,
                 }
                 save_json_data(QUARANTINE_FILE, q_data)
+            else:
+                effective_type = q_data[uid].get("type", "account_age") if isinstance(q_data[uid], dict) else "account_age"
 
         # Clear prison data if present to prioritize strict quarantine
         async with self.prison_lock:
@@ -401,7 +409,7 @@ class Moderation(commands.Cog):
         view = discord.ui.View(timeout=None)
         view.add_item(QuarantineReleaseButton(member.id))
 
-        if is_automod:
+        if is_automod or effective_type == "automod":
             details = automod_details or {}
             rule_name = details.get("rule_name", "AutoMod Rule")
             keyword = details.get("matched_keyword")
@@ -426,13 +434,25 @@ class Moderation(commands.Cog):
             if source_ch:
                 log_msg += f"\n- **Channel:** {source_ch.mention}"
 
-        elif is_evasion:
+        elif is_evasion or effective_type == "evasion":
             user_msg = (
                 f"🚨 **Quarantine Evasion Attempted!** {member.mention}, you tried to rejoin the server while quarantined, "
                 f"but Gate Greeter immediately dragged you back to quarantine.\n\n"
                 f"Please wait for staff review."
             )
             log_msg = f"🚨 **Quarantine Evasion Detected:** {member.mention} (`{member.name}`) attempted to evade quarantine by rejoining."
+
+        elif effective_type == "manual":
+            by_str = f" by **{quarantined_by.display_name}**" if quarantined_by else ""
+            user_msg = (
+                f"🔒 {member.mention}, you have been placed in quarantine by staff.\n\n"
+                f"**Reason:** {reason}\n\n"
+                f"Please wait here while staff reviews your case before you can be released into the wild."
+            )
+            log_msg = (
+                f"🔒 **Manual Quarantine:** {member.mention} (`{member.name}`, ID: `{member.id}`) was quarantined{by_str}.\n"
+                f"- **Reason:** {reason}"
+            )
 
         else:
             account_age = discord.utils.utcnow() - member.created_at
@@ -467,6 +487,7 @@ class Moderation(commands.Cog):
         member: discord.Member,
         released_by: discord.Member | discord.User,
         channel: discord.abc.Messageable | None = None,
+        reply_to: discord.Message | None = None,
     ) -> tuple[bool, str]:
         """Releases a member from quarantine and restores any roles they previously had."""
         q_role = member.guild.get_role(self.quarantine_role_id)
@@ -521,23 +542,33 @@ class Moderation(commands.Cog):
 
         quarantine_channel = self.get_quarantine_channel(member.guild)
         log_channel = self.get_quarantine_logs_channel(member.guild)
-        release_text = f"🌿 {member.mention} has been released into the wild by {released_by.mention}!"
+        release_text = f"🌿 {member.mention} has been released into the wild!"
 
-        if quarantine_channel:
+        if reply_to:
+            try:
+                await reply_to.reply(release_text)
+            except Exception:
+                if quarantine_channel:
+                    try:
+                        await quarantine_channel.send(release_text)
+                    except discord.Forbidden:
+                        pass
+        elif quarantine_channel:
             try:
                 await quarantine_channel.send(release_text)
             except discord.Forbidden:
                 pass
 
         if channel and (not quarantine_channel or channel.id != quarantine_channel.id):
-            try:
-                await channel.send(release_text)
-            except discord.Forbidden:
-                pass
+            if not reply_to or channel.id != reply_to.channel.id:
+                try:
+                    await channel.send(release_text)
+                except discord.Forbidden:
+                    pass
 
         if log_channel:
             dm_status = "" if dm_sent else " *(DM could not be delivered: member has DMs closed)*"
-            log_text = f"🌿 **Quarantine Release:** {member.mention} (`{member.name}`) has been released into the wild by {released_by.mention}.{dm_status}"
+            log_text = f"🌿 **Quarantine Release:** {member.mention} (`{member.name}`) has been released into the wild by **{released_by.display_name}**.{dm_status}"
             if not quarantine_channel or log_channel.id != quarantine_channel.id:
                 try:
                     await log_channel.send(log_text)
@@ -614,7 +645,12 @@ class Moderation(commands.Cog):
         if any(role.id in self.staff_role_ids for role in member.roles):
             return await ctx.send(f"🚫 Cannot quarantine staff member {member.mention}.")
 
-        success = await self.quarantine_member(member, reason=f"{reason} (by {ctx.author.name})", quarantine_type="manual")
+        success = await self.quarantine_member(
+            member,
+            reason=reason,
+            quarantine_type="manual",
+            quarantined_by=ctx.author,
+        )
         if success:
             await ctx.send(f"🔒 {member.mention} has been dragged to quarantine.")
         else:
