@@ -379,7 +379,7 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.assertTrue(button.item.disabled)
 
     async def test_manual_quarantine_command(self):
-        """Staff manually quarantining a user saves roles, tags user with manual explanation, and logs with untagged staff name."""
+        """Staff manually quarantining a user saves roles, notifies user once without reason field, and logs with untagged staff name."""
         member = self._create_member(
             user_id=12345,
             name="TargetUser",
@@ -389,6 +389,8 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
         ctx = MagicMock()
         ctx.author = staff
+        ctx.guild = self.guild
+        ctx.channel = self.quarantine_channel
         ctx.send = AsyncMock()
 
         await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Testing manual quarantine")
@@ -399,21 +401,48 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.assertIn(str(member.id), q_data)
         self.assertEqual(q_data[str(member.id)]["type"], "manual")
 
-        # Message in quarantine channel mentions user and states placed by staff, NOT account too new
+        # Exactly 1 message in quarantine channel: mentions user, no reason field, no duplicate ctx.send
         self.quarantine_channel.send.assert_awaited_once()
         q_msg = self.quarantine_channel.send.call_args.args[0]
         self.assertIn(member.mention, q_msg)
-        self.assertIn("placed in quarantine by staff", q_msg)
+        self.assertIn("you have been placed in quarantine.", q_msg)
+        self.assertNotIn("Reason:", q_msg)
         self.assertNotIn("too new", q_msg)
-        self.assertIn("Testing manual quarantine", q_msg)
+        ctx.send.assert_not_awaited()
 
-        # Log in quarantine logs channel states manual quarantine with bold name, no staff tag
+        # Log in quarantine logs channel states manual quarantine with bold name, no staff tag, no reason field
         self.quarantine_logs_channel.send.assert_awaited_once()
         log_msg = self.quarantine_logs_channel.send.call_args.args[0]
         self.assertIn("Manual Quarantine:", log_msg)
         self.assertIn(f"by **{staff.display_name}**", log_msg)
         self.assertNotIn(staff.mention, log_msg)
+        self.assertNotIn("Reason:", log_msg)
         self.assertNotIn("Auto-Quarantine:", log_msg)
+
+    async def test_manual_quarantine_from_other_channel_sends_single_confirmation(self):
+        """Staff quarantining from another channel (e.g. mods chat) sends card to quarantine and untagged confirmation to mods chat."""
+        member = self._create_member(
+            user_id=12345,
+            name="TargetUser",
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role, self.user_role1],
+        )
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        other_channel = MagicMock(spec=discord.TextChannel, id=888, name="mods-chat")
+        other_channel.send = AsyncMock()
+
+        ctx = MagicMock()
+        ctx.author = staff
+        ctx.guild = self.guild
+        ctx.channel = other_channel
+        ctx.send = other_channel.send
+
+        await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Testing")
+
+        # 1 card in quarantine channel
+        self.quarantine_channel.send.assert_awaited_once()
+        # 1 untagged confirmation in other channel
+        other_channel.send.assert_awaited_once_with(f"🔒 **{member.display_name}** has been dragged to quarantine.")
 
     async def test_release_button_click_by_non_staff_denied(self):
         """Non-staff clicking the release button gets rejected."""

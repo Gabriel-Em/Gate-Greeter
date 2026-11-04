@@ -445,14 +445,10 @@ class Moderation(commands.Cog):
         elif effective_type == "manual":
             by_str = f" by **{quarantined_by.display_name}**" if quarantined_by else ""
             user_msg = (
-                f"🔒 {member.mention}, you have been placed in quarantine by staff.\n\n"
-                f"**Reason:** {reason}\n\n"
+                f"🔒 {member.mention}, you have been placed in quarantine.\n\n"
                 f"Please wait here while staff reviews your case before you can be released into the wild."
             )
-            log_msg = (
-                f"🔒 **Manual Quarantine:** {member.mention} (`{member.name}`, ID: `{member.id}`) was quarantined{by_str}.\n"
-                f"- **Reason:** {reason}"
-            )
+            log_msg = f"🔒 **Manual Quarantine:** {member.mention} (`{member.name}`, ID: `{member.id}`) was quarantined{by_str}."
 
         else:
             account_age = discord.utils.utcnow() - member.created_at
@@ -652,7 +648,9 @@ class Moderation(commands.Cog):
             quarantined_by=ctx.author,
         )
         if success:
-            await ctx.send(f"🔒 {member.mention} has been dragged to quarantine.")
+            quarantine_channel = self.get_quarantine_channel(ctx.guild)
+            if not quarantine_channel or ctx.channel.id != quarantine_channel.id:
+                await ctx.send(f"🔒 **{member.display_name}** has been dragged to quarantine.")
         else:
             await ctx.send(f"⚠️ Could not quarantine {member.mention}.")
 

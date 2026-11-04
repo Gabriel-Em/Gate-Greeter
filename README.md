@@ -5,7 +5,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 ## Features
 
 ### 🛡️ Moderation & Security System
-- **Manual Quarantine (`!quarantine @user <reason>`)**: Allows staff with `manage_roles` permissions to manually quarantine a user, securely snapshotting all their roles, stripping non-category roles, assigning the Quarantine role, and posting an explanation in the quarantine channel with a one-click release button.
+- **Manual Quarantine (`!quarantine @user`)**: Allows staff with `manage_roles` permissions to manually quarantine a user, securely snapshotting all their roles, stripping non-category roles, assigning the Quarantine role, and posting an alert in the quarantine channel with a one-click release button.
 - **Prison & Quarantine Release (`!release @user` / `!unquarantine @user` / "🌿 Release into the Wild" Button)**:
   - Easily releases quarantined users or prison inmates into the wild, automatically restoring all of their prior saved roles (`quarantine_data.json` / `prison_data.json`).
   - Quarantine alerts in the quarantine channel include an interactive, persistent **"🌿 Release into the Wild"** button allowing staff to release quarantined users with a single click.
