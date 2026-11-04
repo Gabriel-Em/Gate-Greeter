@@ -227,5 +227,3 @@ backups/
 prison_data.json
 unc_data.json
 trust_data.json
-llm_optout.json
-llm_cooldowns.json

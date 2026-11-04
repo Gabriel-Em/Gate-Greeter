@@ -11,6 +11,8 @@ load_dotenv()
 intents = discord.Intents.default()
 intents.message_content = True
 intents.members = True
+intents.auto_moderation_execution = True
+intents.auto_moderation_configuration = True
 
 # Disable default help so we can register our own custom embed help command
 bot = commands.Bot(command_prefix="!", intents=intents, help_command=None)
@@ -33,10 +35,6 @@ async def load_extensions():
     if is_env_enabled("ENABLE_BACKUP"):
         await bot.load_extension("cogs.backup")
         print("Loaded module: Backup")
-
-    if is_env_enabled("ENABLE_LLM"):
-        await bot.load_extension("cogs.llm")
-        print("Loaded module: LLM")
 
 
 @bot.event
@@ -105,26 +103,11 @@ async def help_command(ctx):
     analytics_enabled = is_env_enabled("ENABLE_ANALYTICS")
     moderation_enabled = is_env_enabled("ENABLE_MODERATION")
     backup_enabled = is_env_enabled("ENABLE_BACKUP")
-    llm_enabled = is_env_enabled("ENABLE_LLM")
     prison_active = moderation_enabled and is_env_enabled("ENABLE_CMD_PRISON")
     snapshot_active = backup_enabled and is_env_enabled("ENABLE_CMD_SNAPSHOT")
-    ask_active = llm_enabled and is_env_enabled("ENABLE_CMD_ASK")
-    optout_active = llm_enabled and is_env_enabled("ENABLE_CMD_OPTOUT")
     active_msg_threshold = get_env_int("PRONOUN_ACTIVE_MSG_THRESHOLD", 50)
-    llm_rate_limit_count = get_env_int("LLM_RATE_LIMIT_COUNT", 2)
-    llm_rate_limit_hours = get_env_int("LLM_RATE_LIMIT_HOURS", 24)
 
     commands_info = [
-        {
-            "name": "!ask [question]",
-            "desc": f"Ask the AI assistant a standalone question or a question about recent chat history ({llm_rate_limit_count} requests / {llm_rate_limit_hours}h).",
-            "active": ask_active,
-        },
-        {
-            "name": "!optout",
-            "desc": "Toggles your privacy opt-out status so your messages are ignored when `!ask` fetches channel history.",
-            "active": optout_active,
-        },
         {
             "name": "!topusers [year] <month>",
             "desc": "Shows top 10 most active members for a given year or specific month.",
@@ -151,9 +134,9 @@ async def help_command(ctx):
             "active": prison_active,
         },
         {
-            "name": "!release @user",
-            "desc": "Releases an inmate and restores all their previous roles.",
-            "active": prison_active,
+            "name": "!release @user (or !unquarantine @user)",
+            "desc": "Releases a quarantined user or prison inmate into the wild and restores their previous roles.",
+            "active": moderation_enabled,
         },
         {
             "name": "!snapshot",

@@ -5,10 +5,14 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 ## Features
 
 ### 🛡️ Moderation & Security System
-- **Persistent Prison (`!prison @user` / `!release @user`)**: Strips a user's roles (preserving safe category roles and protecting staff roles), saves their exact role state to a local ledger (`prison_data.json`), and assigns the Inmate role. Releasing the user automatically restores their original roles.
-- **Auto-Quarantine (New Account Protection)**: Automatically quarantines newly created accounts (default: `<= 7` days old, configurable via `QUARANTINE_ACCOUNT_AGE_DAYS`) upon joining, wiping non-category roles, assigning the Quarantine role (overriding any prior prison state), and logging the action in the quarantine logs channel.
+- **Prison & Quarantine Release (`!release @user` / `!unquarantine @user` / "🌿 Release into the Wild" Button)**:
+  - Easily releases quarantined users or prison inmates into the wild, automatically restoring all of their prior saved roles (`quarantine_data.json` / `prison_data.json`).
+  - Quarantine alerts in the quarantine channel include an interactive, persistent **"🌿 Release into the Wild"** button allowing staff to release quarantined users with a single click.
+  - Staff manually removing the Quarantine role in Discord's UI also automatically triggers saved role restoration.
+- **Auto-Quarantine (New Account Protection)**: Automatically quarantines newly created accounts (default: `<= 7` days old, configurable via `QUARANTINE_ACCOUNT_AGE_DAYS`) upon joining, wiping non-category roles, assigning the Quarantine role (overriding any prior prison state), pinging the user with an explanation in the quarantine channel, and logging the action in the quarantine logs channel.
+- **AutoMod New Member Monitoring**: Gate Greeter actively monitors new members who joined the server less than 7 days ago (`QUARANTINE_NEW_MEMBER_DAYS`). If they trigger Discord AutoMod (e.g., banned words, mention spam, or regex filters), they are immediately dragged to quarantine, their prior roles are preserved, and they receive an @-pinged explanation in the quarantine channel with a one-click staff release button.
 - **Evasion Prevention & Strict Role Enforcement**:
-  - If an imprisoned user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, throws them back into prison, and announces the evasion attempt in the general channel.
+  - If an imprisoned or quarantined user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, drags them back into prison or quarantine, and logs the evasion attempt.
   - Monitors member role updates in real time (`on_member_update`) and immediately strips any unauthorized self-assigned or onboarding roles acquired while a user is in Quarantine or Prison.
 - **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s) and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently via `unc_data.json`, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
 - **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions (`trust_data.json`). Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
@@ -28,14 +32,6 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message graphs.
 - **`!archive`**: Deep scans and archives message counts for the past 12 months.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
-
-### 🧠 Stateless Two-Pass LLM Assistant (`!ask` & `!optout`)
-- **Two-Pass LLM Pipeline (`!ask [question]`)**:
-  - **Pass 1 (The Router)**: Uses a fast Gemini model (`LLM_ROUTER_MODEL`, default `gemini-3.5-flash-lite`) with structured JSON output to determine whether the query requires channel context or is a standalone question, extracting an optimized question and any target usernames.
-  - **Conditional Context Fetching**: When context is required, fetches up to `LLM_HISTORY_FETCH_LIMIT` (default 300) of the most recent channel messages, filtering to target participants if specified while excluding opted-out users.
-  - **Pass 2 (The Synthesizer)**: Sends the combined intent, optimized question, privacy opt-out notices, and filtered chat history to the primary Gemini model (`LLM_SYNTHESIZER_MODEL`, default `gemini-3.8-flash`) in a completely stateless call.
-- **Per-User Rate Limiting**: Restricts usage to `LLM_RATE_LIMIT_COUNT` requests (default 2) per `LLM_RATE_LIMIT_HOURS` window (default 24 hours), persisted in `llm_cooldowns.json`, and displays the exact remaining time (`hours, minutes, seconds`) when on cooldown.
-- **Privacy Opt-Out (`!optout`)**: Allows any user to toggle their opt-out status (`llm_optout.json`). Messages from opted-out users are completely ignored during context fetching, and Pass 2 is explicitly informed that messages from those users are unavailable due to opt-out.
 
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
@@ -61,7 +57,6 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    ENABLE_AUTO_RESPONDER=True
    ENABLE_MODERATION=True
    ENABLE_BACKUP=True
-   ENABLE_LLM=True
 
    # Granular Analytics Commands
    ENABLE_CMD_ARCHIVE=True
@@ -79,19 +74,9 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    # Backup Commands
    ENABLE_CMD_SNAPSHOT=True
 
-   # LLM Commands & Configuration
-   ENABLE_CMD_ASK=True
-   ENABLE_CMD_OPTOUT=True
-   GEMINI_API_KEY=your_gemini_api_key_here
-   LLM_ROUTER_MODEL=gemini-3.5-flash-lite
-   LLM_SYNTHESIZER_MODEL=gemini-3.8-flash
-   LLM_RATE_LIMIT_COUNT=2
-   LLM_RATE_LIMIT_HOURS=24
-   LLM_HISTORY_FETCH_LIMIT=300
-   LLM_REQUEST_TIMEOUT_SECONDS=120
-
    # Moderation Thresholds & Timers
    QUARANTINE_ACCOUNT_AGE_DAYS=7
+   QUARANTINE_NEW_MEMBER_DAYS=7
    TRUST_THRESHOLD=30
    TRUST_COOLDOWN_SECONDS=60
    UNC_MISCLICK_MAX_SECONDS=3.0
@@ -101,6 +86,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 
    # Discord Channel IDs
    GENERAL_CHANNEL_ID=100000000000000001
+   QUARANTINE_CHANNEL_ID=100000000000000002
    QUARANTINE_LOGS_CHANNEL_ID=100000000000000002
    MODS_CHAT_ID=100000000000000003
 

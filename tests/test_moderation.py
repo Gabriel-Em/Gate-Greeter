@@ -1,0 +1,440 @@
+import os
+import sys
+import unittest
+from unittest.mock import AsyncMock, MagicMock, patch
+from datetime import datetime, timedelta, timezone
+
+# Ensure root directory is on sys.path
+sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
+
+import discord
+from discord.ext import commands
+from cogs.moderation import Moderation, QuarantineReleaseButton, QUARANTINE_FILE, PRISON_FILE
+from utils import load_json_data, save_json_data
+
+
+class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
+    async def asyncSetUp(self):
+        # Use temporary file paths for tests
+        self.test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "tmp"))
+        os.makedirs(self.test_dir, exist_ok=True)
+        self.orig_q_file = QUARANTINE_FILE
+        self.orig_p_file = PRISON_FILE
+
+        self.test_q_file = os.path.join(self.test_dir, "test_quarantine_data.json")
+        self.test_p_file = os.path.join(self.test_dir, "test_prison_data.json")
+
+        save_json_data(self.test_q_file, {})
+        save_json_data(self.test_p_file, {})
+
+        # Patch module-level file constants
+        self.patch_q = patch("cogs.moderation.QUARANTINE_FILE", self.test_q_file)
+        self.patch_p = patch("cogs.moderation.PRISON_FILE", self.test_p_file)
+        self.patch_q.start()
+        self.patch_p.start()
+
+        # Mock Bot
+        self.bot = MagicMock(spec=commands.Bot)
+        self.bot.add_dynamic_items = MagicMock()
+        self.bot.remove_dynamic_items = MagicMock()
+
+        # Instantiate Cog
+        self.cog = Moderation(self.bot)
+        self.cog.quarantine_role_id = 999
+        self.cog.inmate_role_id = 888
+        self.cog.quarantine_channel_id = 111
+        self.cog.quarantine_logs_channel_id = 222
+        self.cog.category_role_ids = [500]
+        self.cog.staff_role_ids = [700]
+        self.cog.quarantine_days = 7
+        self.cog.quarantine_new_member_days = 7
+
+        # Setup mock guild & roles
+        self.guild = MagicMock(spec=discord.Guild)
+        self.guild.name = "Test Guild"
+        self.guild.id = 1000
+
+        self.default_role = MagicMock(spec=discord.Role, id=1000, name="@everyone")
+        self.guild.default_role = self.default_role
+
+        self.q_role = MagicMock(spec=discord.Role, id=999, name="Quarantine")
+        self.category_role = MagicMock(spec=discord.Role, id=500, name="Category")
+        self.user_role1 = MagicMock(spec=discord.Role, id=601, name="Role1", managed=False)
+        self.user_role2 = MagicMock(spec=discord.Role, id=602, name="Role2", managed=False)
+        self.staff_role = MagicMock(spec=discord.Role, id=700, name="Moderator")
+        self.bot_top_role = MagicMock(spec=discord.Role, id=9999, name="Bot Top")
+
+        # Top role comparison setup
+        self.bot_top_role.__gt__ = lambda self, other: True
+        self.user_role1.__lt__ = lambda self, other: True
+        self.user_role2.__lt__ = lambda self, other: True
+        self.q_role.__lt__ = lambda self, other: True
+
+        self.bot_member = MagicMock(spec=discord.Member)
+        self.bot_member.top_role = self.bot_top_role
+        self.guild.me = self.bot_member
+
+        def get_role_mock(rid):
+            mapping = {
+                1000: self.default_role,
+                999: self.q_role,
+                500: self.category_role,
+                601: self.user_role1,
+                602: self.user_role2,
+                700: self.staff_role,
+            }
+            return mapping.get(rid)
+
+        self.guild.get_role.side_effect = get_role_mock
+
+        # Setup mock channels
+        self.quarantine_channel = MagicMock(spec=discord.TextChannel, id=111, name="quarantine")
+        self.quarantine_channel.send = AsyncMock()
+
+        self.quarantine_logs_channel = MagicMock(spec=discord.TextChannel, id=222, name="quarantine-logs")
+        self.quarantine_logs_channel.send = AsyncMock()
+
+        def get_channel_mock(cid):
+            mapping = {
+                111: self.quarantine_channel,
+                222: self.quarantine_logs_channel,
+            }
+            return mapping.get(cid)
+
+        self.guild.get_channel.side_effect = get_channel_mock
+
+    async def asyncTearDown(self):
+        self.patch_q.stop()
+        self.patch_p.stop()
+        for f in [self.test_q_file, self.test_p_file]:
+            if os.path.exists(f):
+                os.remove(f)
+        if os.path.exists(self.test_dir):
+            os.rmdir(self.test_dir)
+
+    def _create_member(self, user_id=12345, name="Newbie", created_days_ago=10, joined_days_ago=2, roles=None):
+        member = MagicMock(spec=discord.Member)
+        member.id = user_id
+        member.name = name
+        member.display_name = name
+        member.mention = f"<@{user_id}>"
+        member.bot = False
+        member.guild = self.guild
+        member.roles = list(roles) if roles else [self.default_role]
+        member.created_at = datetime.now(timezone.utc) - timedelta(days=created_days_ago)
+        member.joined_at = datetime.now(timezone.utc) - timedelta(days=joined_days_ago)
+        member.edit = AsyncMock()
+        member.send = AsyncMock()
+        return member
+
+    async def test_auto_quarantine_account_too_new_on_join(self):
+        """Users with accounts created <= 7 days ago are auto-quarantined on join."""
+        member = self._create_member(created_days_ago=3, joined_days_ago=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        # Member roles edited to Quarantine + Category
+        member.edit.assert_awaited_once()
+        edited_roles = member.edit.call_args.kwargs["roles"]
+        self.assertIn(self.q_role, edited_roles)
+
+        # Message sent in quarantine channel mentioning member
+        self.quarantine_channel.send.assert_awaited_once()
+        sent_content = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn(member.mention, sent_content)
+        self.assertIn("too new", sent_content)
+
+        # Release button attached
+        view = self.quarantine_channel.send.call_args.kwargs.get("view")
+        self.assertIsNotNone(view)
+        button = view.children[0]
+        self.assertEqual(button.custom_id, f"quarantine:release:{member.id}")
+
+        # Quarantine log sent
+        self.quarantine_logs_channel.send.assert_awaited_once()
+
+    async def test_automod_new_member_monitoring(self):
+        """New members (joined < 7 days ago) triggering AutoMod are dragged to quarantine."""
+        member = self._create_member(
+            created_days_ago=30,  # Account is older, but server membership is new
+            joined_days_ago=3,   # Joined 3 days ago (< 7)
+            roles=[self.default_role, self.category_role, self.user_role1, self.user_role2]
+        )
+        self.guild.get_member.return_value = member
+
+        # Mock AutoMod Action
+        execution = MagicMock(spec=discord.AutoModAction)
+        execution.guild = self.guild
+        execution.user_id = member.id
+        execution.member = member
+        execution.rule_id = 9999
+        execution.matched_keyword = "banned_word"
+        execution.matched_content = "some banned_word here"
+        execution.channel_id = 333
+        mock_rule = MagicMock()
+        mock_rule.name = "Banned Words Filter"
+        execution.fetch_rule = AsyncMock(return_value=mock_rule)
+
+        await self.cog.on_automod_action(execution)
+
+        # Member roles edited to quarantine
+        member.edit.assert_awaited_once()
+        edited_roles = member.edit.call_args.kwargs["roles"]
+        self.assertIn(self.q_role, edited_roles)
+        self.assertNotIn(self.user_role1, edited_roles)
+
+        # Prior roles saved in quarantine_data.json
+        q_data = load_json_data(self.test_q_file)
+        self.assertIn(str(member.id), q_data)
+        saved_roles = q_data[str(member.id)]["roles"]
+        self.assertIn(self.user_role1.id, saved_roles)
+        self.assertIn(self.user_role2.id, saved_roles)
+
+        # User notified in quarantine channel with their mention and AutoMod rule
+        self.quarantine_channel.send.assert_awaited_once()
+        sent_content = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn(member.mention, sent_content)
+        self.assertIn("flagged by AutoMod", sent_content)
+        self.assertIn("Banned Words Filter", sent_content)
+
+    async def test_automod_older_member_ignored(self):
+        """Members who joined 7+ days ago are NOT quarantined by AutoMod monitoring."""
+        member = self._create_member(
+            created_days_ago=60,
+            joined_days_ago=14,  # Joined 14 days ago (>= 7)
+            roles=[self.default_role, self.user_role1]
+        )
+        self.guild.get_member.return_value = member
+
+        execution = MagicMock(spec=discord.AutoModAction)
+        execution.guild = self.guild
+        execution.user_id = member.id
+        execution.member = member
+        execution.fetch_rule = AsyncMock()
+
+        await self.cog.on_automod_action(execution)
+
+        # Member should NOT be edited
+        member.edit.assert_not_awaited()
+        self.quarantine_channel.send.assert_not_awaited()
+
+    async def test_release_quarantined_member_restores_roles(self):
+        """Releasing an AutoMod quarantined user restores their saved roles, clears quarantine data, and sends DM."""
+        member = self._create_member(
+            roles=[self.default_role, self.category_role, self.q_role]
+        )
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+
+        # Save prior roles in quarantine ledger with type automod
+        save_json_data(self.test_q_file, {
+            str(member.id): {
+                "roles": [self.user_role1.id, self.user_role2.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Test",
+                "type": "automod",
+            }
+        })
+
+        success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
+        self.assertTrue(success)
+
+        # Check roles restored
+        member.edit.assert_awaited_once()
+        restored = member.edit.call_args.kwargs["roles"]
+        self.assertIn(self.user_role1, restored)
+        self.assertIn(self.user_role2, restored)
+        self.assertNotIn(self.q_role, restored)
+
+        # DM sent with restoration message
+        member.send.assert_awaited_once()
+        dm_content = member.send.call_args.args[0]
+        self.assertIn("previous roles and server access have been restored", dm_content)
+        self.assertIn("StaffMod", dm_content)
+
+        # Removed from json
+        q_data = load_json_data(self.test_q_file)
+        self.assertNotIn(str(member.id), q_data)
+
+        # Announced in quarantine channel
+        self.quarantine_channel.send.assert_awaited()
+        announcement = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn(member.mention, announcement)
+        self.assertIn("released into the wild", announcement)
+
+    async def test_release_quarantined_account_age_does_not_restore_partial_roles(self):
+        """Releasing an account_age quarantined user does NOT restore partial onboarding roles and directs to Channels & Roles via DM."""
+        member = self._create_member(
+            roles=[self.default_role, self.category_role, self.q_role]
+        )
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+
+        # Save partial onboarding roles clicked on join
+        save_json_data(self.test_q_file, {
+            str(member.id): {
+                "roles": [self.user_role1.id, self.user_role2.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Account too new",
+                "type": "account_age",
+            }
+        })
+
+        success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
+        self.assertTrue(success)
+
+        # Check partial roles were NOT restored
+        member.edit.assert_awaited_once()
+        restored = member.edit.call_args.kwargs["roles"]
+        self.assertNotIn(self.user_role1, restored)
+        self.assertNotIn(self.user_role2, restored)
+        self.assertNotIn(self.q_role, restored)
+        self.assertIn(self.category_role, restored)
+
+        # DM sent with Channels & Roles onboarding instructions
+        member.send.assert_awaited_once()
+        dm_content = member.send.call_args.args[0]
+        self.assertIn("Channels & Roles", dm_content)
+        self.assertIn("Welcome to the server", dm_content)
+
+    async def test_release_quarantine_dm_failure_handled_gracefully(self):
+        """If user has DMs closed, release still succeeds without crashing."""
+        member = self._create_member(
+            roles=[self.default_role, self.category_role, self.q_role]
+        )
+        member.send.side_effect = discord.Forbidden(MagicMock(), "Cannot send messages to this user")
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+
+        save_json_data(self.test_q_file, {
+            str(member.id): {
+                "roles": [self.user_role1.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Test",
+                "type": "automod",
+            }
+        })
+
+        success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
+        self.assertTrue(success)
+        member.edit.assert_awaited_once()
+
+    async def test_release_command_handles_quarantine(self):
+        """!release command works for quarantined members."""
+        member = self._create_member(roles=[self.default_role, self.q_role])
+        ctx = MagicMock()
+        ctx.author = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx.channel = self.quarantine_channel
+        ctx.send = AsyncMock()
+        ctx.guild = self.guild
+
+        await self.cog.release.callback(self.cog, ctx, member)
+
+        member.edit.assert_awaited_once()
+        restored = member.edit.call_args.kwargs["roles"]
+        self.assertNotIn(self.q_role, restored)
+
+    async def test_release_button_click_by_staff(self):
+        """Clicking the dynamic release button releases member if staff."""
+        member = self._create_member(roles=[self.default_role, self.q_role])
+        self.guild.get_member.return_value = member
+
+        button = QuarantineReleaseButton(member.id)
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.client = self.bot
+        self.bot.get_cog.return_value = self.cog
+        interaction.guild = self.guild
+        interaction.user = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        interaction.user.guild_permissions.manage_roles = True
+        interaction.response = MagicMock()
+        interaction.response.defer = AsyncMock()
+        interaction.response.send_message = AsyncMock()
+        interaction.followup = MagicMock()
+        interaction.followup.send = AsyncMock()
+        interaction.channel = MagicMock(spec=discord.TextChannel)
+        interaction.channel.id = 999
+        interaction.channel.send = AsyncMock()
+        interaction.message = MagicMock()
+        interaction.message.edit = AsyncMock()
+
+        await button.callback(interaction)
+
+        interaction.response.defer.assert_awaited_once()
+        member.edit.assert_awaited_once()
+        interaction.followup.send.assert_awaited_once()
+        self.assertTrue(button.item.disabled)
+
+    async def test_release_button_click_by_non_staff_denied(self):
+        """Non-staff clicking the release button gets rejected."""
+        member = self._create_member(roles=[self.default_role, self.q_role])
+        self.guild.get_member.return_value = member
+
+        button = QuarantineReleaseButton(member.id)
+        interaction = MagicMock(spec=discord.Interaction)
+        interaction.client = self.bot
+        self.bot.get_cog.return_value = self.cog
+        interaction.guild = self.guild
+        non_staff = self._create_member(user_id=444, name="RegularUser", roles=[self.default_role])
+        non_staff.guild_permissions.manage_roles = False
+        non_staff.guild_permissions.administrator = False
+        interaction.user = non_staff
+        interaction.response = MagicMock()
+        interaction.response.send_message = AsyncMock()
+
+        await button.callback(interaction)
+
+        interaction.response.send_message.assert_awaited_once()
+        err_msg = interaction.response.send_message.call_args.args[0]
+        self.assertIn("don't have permission", err_msg)
+        member.edit.assert_not_awaited()
+
+
+    async def test_manual_quarantine_role_removal_in_ui(self):
+        """When staff manually removes Quarantine role in Discord UI, saved roles are restored and DM is sent."""
+        member_before = self._create_member(roles=[self.default_role, self.category_role, self.q_role])
+        member_after = self._create_member(roles=[self.default_role, self.category_role])
+        member_after.add_roles = AsyncMock()
+
+        # Save prior roles with type automod
+        save_json_data(self.test_q_file, {
+            str(member_after.id): {
+                "roles": [self.user_role1.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Test UI removal",
+                "type": "automod",
+            }
+        })
+
+        await self.cog.on_member_update(member_before, member_after)
+
+        member_after.add_roles.assert_awaited_once_with(self.user_role1, reason="Quarantine role manually removed: Restored prior roles.")
+        member_after.send.assert_awaited_once()
+        q_data = load_json_data(self.test_q_file)
+        self.assertNotIn(str(member_after.id), q_data)
+
+    async def test_quarantine_evasion_on_rejoin(self):
+        """User in quarantine who leaves and rejoins gets dragged back to quarantine."""
+        member = self._create_member(created_days_ago=50, joined_days_ago=0)
+
+        save_json_data(self.test_q_file, {
+            str(member.id): {
+                "roles": [self.user_role1.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Prior quarantine",
+            }
+        })
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        # Should be re-quarantined
+        member.edit.assert_awaited_once()
+        edited_roles = member.edit.call_args.kwargs["roles"]
+        self.assertIn(self.q_role, edited_roles)
+        # Check evasion message sent
+        sent_content = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn("Quarantine Evasion Attempted", sent_content)
+
+
+if __name__ == "__main__":
+    unittest.main()
