@@ -37,6 +37,7 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.bot = MagicMock(spec=commands.Bot)
         self.bot.add_dynamic_items = MagicMock()
         self.bot.remove_dynamic_items = MagicMock()
+        self.bot.get_guild.return_value = None
 
         # Instantiate Cog
         self.cog = Moderation(self.bot)
@@ -53,6 +54,8 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.guild = MagicMock(spec=discord.Guild)
         self.guild.name = "Test Guild"
         self.guild.id = 1000
+        self.guild.fetch_member = AsyncMock(side_effect=lambda uid: self.guild.get_member(uid))
+        self.bot.get_guild.return_value = self.guild
 
         self.default_role = MagicMock(spec=discord.Role, id=1000, name="@everyone")
         self.guild.default_role = self.default_role
@@ -217,6 +220,94 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         await self.cog.on_automod_action(execution)
 
         # Member should NOT be edited
+        member.edit.assert_not_awaited()
+        self.quarantine_channel.send.assert_not_awaited()
+
+    async def test_automod_rejoining_member_quarantined(self):
+        """Account created 5 years ago that rejoined the server minutes ago is quarantined upon AutoMod violation."""
+        member = self._create_member(
+            created_days_ago=1825,  # 5-year-old Discord account
+            joined_days_ago=0.005,  # Rejoined ~7 minutes ago (< 7 days)
+            roles=[self.default_role, self.category_role, self.user_role1],
+        )
+        self.guild.get_member.return_value = member
+
+        execution = MagicMock(spec=discord.AutoModAction)
+        execution.guild_id = self.guild.id
+        execution.guild = self.guild
+        execution.user_id = member.id
+        execution.member = member
+        execution.rule_id = 1111
+        execution.matched_keyword = "banned_slur"
+        execution.matched_content = "some banned_slur here"
+        execution.channel_id = 333
+        mock_rule = MagicMock()
+        mock_rule.name = "Slurs Filter"
+        execution.fetch_rule = AsyncMock(return_value=mock_rule)
+
+        await self.cog.on_automod_action(execution)
+
+        # Successfully quarantined
+        member.edit.assert_awaited_once()
+        edited_roles = member.edit.call_args.kwargs["roles"]
+        self.assertIn(self.q_role, edited_roles)
+        self.assertNotIn(self.user_role1, edited_roles)
+
+        # Added to ledger with type automod
+        q_data = load_json_data(self.test_q_file)
+        self.assertIn(str(member.id), q_data)
+        self.assertEqual(q_data[str(member.id)]["type"], "automod")
+
+    async def test_automod_already_quarantined_user_in_ledger_ignored(self):
+        """User already in quarantine ledger who triggers AutoMod in quarantine does not trigger a re-quarantine."""
+        member = self._create_member(
+            created_days_ago=30,
+            joined_days_ago=2,
+            roles=[self.default_role, self.q_role],
+        )
+        self.guild.get_member.return_value = member
+
+        # User is already recorded in quarantine data
+        save_json_data(self.test_q_file, {
+            str(member.id): {
+                "roles": [self.user_role1.id],
+                "quarantined_at": datetime.now().isoformat(),
+                "reason": "Previous quarantine",
+                "type": "automod",
+            }
+        })
+
+        execution = MagicMock(spec=discord.AutoModAction)
+        execution.guild_id = self.guild.id
+        execution.guild = self.guild
+        execution.user_id = member.id
+        execution.member = member
+        execution.channel_id = self.quarantine_channel.id
+
+        await self.cog.on_automod_action(execution)
+
+        # Should NOT edit roles or send another message to quarantine channel
+        member.edit.assert_not_awaited()
+        self.quarantine_channel.send.assert_not_awaited()
+
+    async def test_automod_in_quarantine_channel_ignored(self):
+        """AutoMod violations occurring inside the quarantine channel itself are ignored."""
+        member = self._create_member(
+            created_days_ago=30,
+            joined_days_ago=1,
+            roles=[self.default_role, self.q_role],
+        )
+        self.guild.get_member.return_value = member
+
+        execution = MagicMock(spec=discord.AutoModAction)
+        execution.guild_id = self.guild.id
+        execution.guild = self.guild
+        execution.user_id = member.id
+        execution.member = member
+        execution.channel_id = self.quarantine_channel.id
+
+        await self.cog.on_automod_action(execution)
+
         member.edit.assert_not_awaited()
         self.quarantine_channel.send.assert_not_awaited()
 
