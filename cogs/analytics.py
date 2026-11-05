@@ -19,7 +19,8 @@ from utils import (
 # MODULE-LEVEL CONSTANTS
 # ---------------------------------------------------------
 STATS_DIR = "monthly_stats"
-EXCLUDED_CHANNEL_SUFFIX = "logs"
+EXCLUDED_CHANNEL_SUFFIXES = ("logs", "log")
+EXCLUDED_CHANNEL_SUFFIX = EXCLUDED_CHANNEL_SUFFIXES
 
 ARCHIVE_MONTHS_COUNT = 12
 ACTIVITY_DAYS_WINDOW = 30

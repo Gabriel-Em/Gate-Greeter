@@ -224,6 +224,9 @@ class TestEmojiCommands(unittest.IsolatedAsyncioTestCase):
 
         await self.cog.emojileaderboard.callback(self.cog, self.ctx)
 
+        # Confirm log channels are never inspected
+        self.logs_channel.history.assert_not_called()
+
         status_msg.delete.assert_called_once()
         self.assertEqual(self.ctx.send.call_count, 2)
         embed = self.ctx.send.call_args_list[1][1].get("embed")
@@ -289,6 +292,9 @@ class TestEmojiCommands(unittest.IsolatedAsyncioTestCase):
         self.channel1.history = MagicMock(side_effect=history_iter)
 
         await self.cog.emojileaderboard.callback(self.cog, self.ctx)
+
+        # Confirm log channels are never inspected
+        self.logs_channel.history.assert_not_called()
 
         status_msg.delete.assert_called_once()
         self.assertEqual(self.ctx.send.call_count, 2)
