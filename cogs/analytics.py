@@ -1,7 +1,9 @@
 import os
 import io
+import re
 import asyncio
 from datetime import datetime, timedelta
+from collections import Counter, defaultdict
 import matplotlib.pyplot as plt
 import discord
 from discord.ext import commands
@@ -23,11 +25,61 @@ ARCHIVE_MONTHS_COUNT = 12
 ACTIVITY_DAYS_WINDOW = 30
 TOP_USERS_LIMIT = 10
 STATUS_UPDATE_INTERVAL = 5
+EMOJI_SELF_LIMIT = 10
+EMOJI_LEADERBOARD_LIMIT = 15
+EMOJI_DAYS_WINDOW = 30
 
 COLOR_HOURLY_BAR = "#3b82f6"
 COLOR_DAILY_LINE = "#10b981"
 COLOR_PRONOUN_BAR = "#f97316"
 COLOR_UNKNOWN_BAR = "#64748b"
+
+CUSTOM_EMOJI_REGEX = re.compile(r"<a?:[a-zA-Z0-9_]+:[0-9]+>")
+
+UNICODE_EMOJI_REGEX = re.compile(
+    r"("
+    r"[\U0001F1E6-\U0001F1FF]{2}"
+    r"|[0-9#*]\uFE0F?\u20E3"
+    r"|[\u00A9\u00AE\u203C\u2049\u2122\u2139\u2194-\u2199\u21A9-\u21AA\u231A-\u231B\u2328\u23CF\u23E9-\u23F3\u23F8-\u23FA\u24C2\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE\u2600-\u26FF\u2700-\u27BF\u2934-\u2935\u2B05-\u2B07\u2B1B-\u2B1C\u2B50\u2B55\u3030\u303D\u3297\u3299]"
+    r"|[\U0001F000-\U0001F02F]"
+    r"|[\U0001F0A0-\U0001F0FF]"
+    r"|[\U0001F100-\U0001F64F]"
+    r"|[\U0001F680-\U0001F6FF]"
+    r"|[\U0001F700-\U0001F77F]"
+    r"|[\U0001F780-\U0001F7FF]"
+    r"|[\U0001F800-\U0001F8FF]"
+    r"|[\U0001F900-\U0001F9FF]"
+    r"|[\U0001FA00-\U0001FA6F]"
+    r"|[\U0001FA70-\U0001FAFF]"
+    r")"
+    r"([\U0001F3FB-\U0001F3FF])?"
+    r"(\uFE0F)?"
+    r"(\u200D("
+    r"[\U0001F1E6-\U0001F1FF]{2}"
+    r"|[0-9#*]\uFE0F?\u20E3"
+    r"|[\u00A9\u00AE\u203C\u2049\u2122\u2139\u2194-\u2199\u21A9-\u21AA\u231A-\u231B\u2328\u23CF\u23E9-\u23F3\u23F8-\u23FA\u24C2\u25AA-\u25AB\u25B6\u25C0\u25FB-\u25FE\u2600-\u26FF\u2700-\u27BF\u2934-\u2935\u2B05-\u2B07\u2B1B-\u2B1C\u2B50\u2B55\u3030\u303D\u3297\u3299]"
+    r"|[\U0001F000-\U0001F02F]"
+    r"|[\U0001F0A0-\U0001F0FF]"
+    r"|[\U0001F100-\U0001F64F]"
+    r"|[\U0001F680-\U0001F6FF]"
+    r"|[\U0001F700-\U0001F77F]"
+    r"|[\U0001F780-\U0001F7FF]"
+    r"|[\U0001F800-\U0001F8FF]"
+    r"|[\U0001F900-\U0001F9FF]"
+    r"|[\U0001FA00-\U0001FA6F]"
+    r"|[\U0001FA70-\U0001FAFF]"
+    r")([\U0001F3FB-\U0001F3FF])?(\uFE0F)?)*"
+)
+
+
+def extract_emojis(content: str) -> list[str]:
+    """Extracts all custom Discord and Unicode emojis from a message string in order."""
+    if not content:
+        return []
+    customs = CUSTOM_EMOJI_REGEX.findall(content)
+    cleaned = CUSTOM_EMOJI_REGEX.sub(" ", content)
+    unicodes = [m.group(0) for m in UNICODE_EMOJI_REGEX.finditer(cleaned)]
+    return customs + unicodes
 
 
 class Analytics(commands.Cog):
@@ -398,6 +450,152 @@ class Analytics(commands.Cog):
         await ctx.send(
             f"Here are the active user demographic statistics for {year}:", file=file
         )
+
+    @commands.command(name="myemojis", aliases=["emojiself", "selfemojis"])
+    async def myemojis(self, ctx, *args):
+        """Shows your top 10 most used emojis from the past 30 days. Personal only."""
+        if not self._is_enabled("ENABLE_CMD_MYEMOJIS"):
+            return
+
+        if args:
+            return await ctx.send(
+                "🔒 **Privacy Notice:** `!myemojis` is a personal command that only inspects your own messages. "
+                "Scanning other users' messages is not allowed."
+            )
+
+        status_msg = await ctx.send(
+            f"🔍 Analyzing your emojis from the past {EMOJI_DAYS_WINDOW} days, {ctx.author.mention}..."
+        )
+
+        start_dt = discord.utils.utcnow() - timedelta(days=EMOJI_DAYS_WINDOW)
+        emoji_counts = Counter()
+
+        for channel in ctx.guild.text_channels:
+            if not channel.permissions_for(ctx.guild.me).read_message_history:
+                continue
+            if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
+                continue
+
+            try:
+                async for msg in channel.history(limit=None, after=start_dt):
+                    if msg.author.id != ctx.author.id:
+                        continue
+                    emojis = extract_emojis(msg.content)
+                    if emojis:
+                        emoji_counts.update(emojis)
+            except discord.Forbidden:
+                pass
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        if not emoji_counts:
+            return await ctx.send(
+                f"ℹ️ No emojis found in your messages over the past {EMOJI_DAYS_WINDOW} days."
+            )
+
+        top_emojis = emoji_counts.most_common(EMOJI_SELF_LIMIT)
+
+        embed = discord.Embed(
+            title=f"📊 Your Top {len(top_emojis)} Emojis (Past {EMOJI_DAYS_WINDOW} Days)",
+            color=discord.Color.blue(),
+        )
+        embed.set_author(
+            name=f"{ctx.author.display_name}'s Emoji Stats",
+            icon_url=ctx.author.display_avatar.url if ctx.author.display_avatar else None,
+        )
+        lines = [
+            f"**{rank}.** {emoji} — **{count:,}** use{'s' if count != 1 else ''}"
+            for rank, (emoji, count) in enumerate(top_emojis, 1)
+        ]
+        embed.description = "\n".join(lines)
+        embed.set_footer(
+            text=f"Total unique emojis: {len(emoji_counts)} | Total uses: {sum(emoji_counts.values()):,}"
+        )
+
+        await ctx.send(embed=embed)
+
+    @commands.command(name="emojileaderboard", aliases=["topemojis", "emojitop"])
+    async def emojileaderboard(self, ctx):
+        """Server-wide leaderboard of top 15 most used emojis and their top user over the past 30 days."""
+        if not self._is_enabled("ENABLE_CMD_EMOJILEADERBOARD"):
+            return
+
+        status_msg = await ctx.send(
+            f"📊 Compiling server-wide emoji leaderboard for the past {EMOJI_DAYS_WINDOW} days..."
+        )
+
+        start_dt = discord.utils.utcnow() - timedelta(days=EMOJI_DAYS_WINDOW)
+        total_counts = Counter()
+        emoji_user_counts = defaultdict(Counter)
+        user_names = {}
+
+        total_channels = len(ctx.guild.text_channels)
+        for idx, channel in enumerate(ctx.guild.text_channels, 1):
+            if not channel.permissions_for(ctx.guild.me).read_message_history:
+                continue
+            if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
+                continue
+
+            if idx % STATUS_UPDATE_INTERVAL == 0:
+                try:
+                    await status_msg.edit(
+                        content=f"📊 Compiling emoji leaderboard — Scanning channel {idx}/{total_channels}..."
+                    )
+                except Exception:
+                    pass
+
+            try:
+                async for msg in channel.history(limit=None, after=start_dt):
+                    if msg.author.bot:
+                        continue
+
+                    emojis = extract_emojis(msg.content)
+                    if not emojis:
+                        continue
+
+                    total_counts.update(emojis)
+                    user_names[msg.author.id] = msg.author.display_name
+                    for emoji, count in Counter(emojis).items():
+                        emoji_user_counts[emoji][msg.author.id] += count
+            except discord.Forbidden:
+                pass
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        if not total_counts:
+            return await ctx.send(
+                f"ℹ️ No emojis found in server messages over the past {EMOJI_DAYS_WINDOW} days."
+            )
+
+        top_emojis = total_counts.most_common(EMOJI_LEADERBOARD_LIMIT)
+
+        lines = []
+        for rank, (emoji, total) in enumerate(top_emojis, 1):
+            top_uid, top_uses = emoji_user_counts[emoji].most_common(1)[0]
+            top_name = user_names.get(top_uid, "Unknown User")
+            lines.append(
+                f"**{rank}.** {emoji} — **{total:,}** use{'s' if total != 1 else ''} "
+                f"(Top user: **{top_name}** with {top_uses:,})"
+            )
+
+        embed = discord.Embed(
+            title=f"🏆 Server Emoji Leaderboard (Past {EMOJI_DAYS_WINDOW} Days)",
+            color=discord.Color.gold(),
+        )
+        embed.description = "\n".join(lines)
+        embed.set_footer(
+            text=f"Total unique emojis: {len(total_counts)} | Total uses: {sum(total_counts.values()):,}"
+        )
+
+        await ctx.send(embed=embed)
 
 
 async def setup(bot):

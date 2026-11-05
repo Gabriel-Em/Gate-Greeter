@@ -33,6 +33,8 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message graphs.
 - **`!archive`**: Deep scans and archives message counts for the past 12 months.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
+- **`!myemojis`**: Scans your personal messages over the past 30 days and shows your top 10 most used emojis with counts. Protected by privacy rules so other users cannot order scans of your messages.
+- **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days and attributing the top user for each emoji.
 
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
@@ -64,6 +66,8 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
    ENABLE_CMD_ACTIVITY30=True
    ENABLE_CMD_TOPUSERS=True
    ENABLE_CMD_PRONOUNSTATS=True
+   ENABLE_CMD_MYEMOJIS=True
+   ENABLE_CMD_EMOJILEADERBOARD=True
 
    # Granular Auto-Responders
    ENABLE_RESP_VO2MAX=True

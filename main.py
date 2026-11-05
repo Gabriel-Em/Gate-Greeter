@@ -129,6 +129,16 @@ async def help_command(ctx):
             "active": analytics_enabled and is_env_enabled("ENABLE_CMD_PRONOUNSTATS"),
         },
         {
+            "name": "!myemojis",
+            "desc": "Shows your personal top 10 most used emojis from the past 30 days.",
+            "active": analytics_enabled and is_env_enabled("ENABLE_CMD_MYEMOJIS"),
+        },
+        {
+            "name": "!emojileaderboard",
+            "desc": "Server-wide leaderboard of top 15 most used emojis and who used each the most.",
+            "active": analytics_enabled and is_env_enabled("ENABLE_CMD_EMOJILEADERBOARD"),
+        },
+        {
             "name": "!prison @user",
             "desc": "Strips a user's roles (except categories), saves them, and sends them to Prison Island.",
             "active": prison_active,
