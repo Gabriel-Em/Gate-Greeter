@@ -150,6 +150,20 @@ class Moderation(commands.Cog):
     async def cog_unload(self):
         self.bot.remove_dynamic_items(QuarantineReleaseButton)
 
+    @commands.Cog.listener()
+    async def on_ready(self):
+        for guild in self.bot.guilds:
+            me = guild.me
+            perms = me.guild_permissions
+            print(f"[Moderation] Permissions audit for '{guild.name}' (ID: {guild.id}):")
+            print(f"  - Manage Server (manage_guild): {'✅ Granted' if perms.manage_guild else '❌ MISSING (Required for AutoMod execution events!)'}")
+            print(f"  - Manage Roles (manage_roles): {'✅ Granted' if perms.manage_roles else '❌ MISSING (Required to quarantine members!)'}")
+            print(f"  - Administrator: {'✅ True' if perms.administrator else 'False'}")
+            q_role = guild.get_role(self.quarantine_role_id)
+            print(f"  - Quarantine Role ({self.quarantine_role_id}): {'✅ Found' if q_role else '❌ NOT FOUND in guild'}")
+            q_chan = self.get_quarantine_channel(guild)
+            print(f"  - Quarantine Channel: {'✅ Found: #' + q_chan.name if q_chan else '❌ NOT FOUND in guild'}")
+
     def get_quarantine_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
         if self.quarantine_channel_id:
             ch = guild.get_channel(self.quarantine_channel_id)
@@ -717,8 +731,11 @@ class Moderation(commands.Cog):
     # ---------------------------------------------------------
     @commands.Cog.listener()
     async def on_automod_action(self, execution: discord.AutoModAction):
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚡ AutoMod event received! Guild ID: {execution.guild_id}, User ID: {execution.user_id}, Rule ID: {execution.rule_id}, Channel ID: {execution.channel_id}")
+
         guild = self.bot.get_guild(execution.guild_id) or execution.guild
         if not guild:
+            print(f"⚠️ AutoMod: Could not resolve guild for ID {execution.guild_id}.")
             return
 
         quarantine_channel = self.get_quarantine_channel(guild)
@@ -728,22 +745,16 @@ class Moderation(commands.Cog):
             return
 
         user_id = execution.user_id
-        uid = str(user_id)
 
-        # 2. Do not re-quarantine if user is already recorded in quarantine ledger
-        async with self.quarantine_lock:
-            q_data = load_json_data(QUARANTINE_FILE)
-            if uid in q_data:
-                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored user ID {user_id} (already tracked in quarantine ledger).")
-                return
-
-        # 3. Always fetch fresh member object from API to guarantee accurate joined_at and roles
+        # 2. Always fetch fresh member object from API to guarantee accurate joined_at and roles
         # (Discord gateway member cache may retain old joined_at or omit it after rejoining)
         member = None
         try:
             member = await guild.fetch_member(user_id)
-        except (discord.NotFound, discord.HTTPException):
+        except (discord.NotFound, discord.HTTPException) as e:
             member = execution.member or guild.get_member(user_id)
+            if not member:
+                print(f"⚠️ AutoMod: Could not find or fetch member with user ID {user_id}: {e}")
 
         if not member:
             return
@@ -751,17 +762,17 @@ class Moderation(commands.Cog):
         if member.bot:
             return
 
-        # 4. Skip staff members
+        # 3. Skip staff members
         if any(role.id in self.staff_role_ids for role in member.roles):
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored staff member {member.name}.")
             return
 
-        # 5. Skip members already having the quarantine role
+        # 4. Skip members already having the quarantine role
         if any(role.id == self.quarantine_role_id for role in member.roles):
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored {member.name} (already has Quarantine role).")
             return
 
-        # 6. Check if the member joined less than self.quarantine_new_member_days ago (default: 7 days)
+        # 5. Check if the member joined less than self.quarantine_new_member_days ago (default: 7 days)
         if not member.joined_at:
             print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Could not resolve join date for {member.name}.")
             return
