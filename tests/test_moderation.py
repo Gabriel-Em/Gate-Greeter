@@ -607,6 +607,26 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         sent_content = self.quarantine_channel.send.call_args.args[0]
         self.assertIn("Quarantine Evasion Attempted", sent_content)
 
+    async def test_on_ready_audit_runs_successfully(self):
+        """on_ready performs comprehensive permission, channel, and role audits without crashing."""
+        self.bot.guilds = [self.guild]
+        # Ensure guild.me attributes are present
+        bot_member = MagicMock()
+        bot_member.__str__.return_value = "Gate Greeter#0001"
+        bot_member.top_role = MagicMock(name="BotRole", position=10)
+        bot_member.top_role.name = "BotRole"
+        bot_member.guild_permissions = MagicMock(
+            administrator=True,
+            manage_guild=True,
+            manage_roles=True,
+            view_audit_log=True,
+            kick_members=True
+        )
+        self.guild.me = bot_member
+
+        # Run on_ready
+        await self.cog.on_ready()
+
 
 if __name__ == "__main__":
     unittest.main()
