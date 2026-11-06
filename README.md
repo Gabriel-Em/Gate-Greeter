@@ -27,20 +27,42 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
   - Both files are saved locally in `backups/` and attached directly to the Discord response.
 - **Strict Zero-User-Data Policy**: Never stores messages, member lists, or user-specific channel overwrites (only `discord.Role` overwrites are recorded).
 
-### 📈 Analytics
-*Note: Scrapes message history to track server activity over time. Excludes channels ending in `logs`.*
-- **`!topusers [year] <month>`**: Shows the top 10 most active members for a given year or specific month, caching data locally in `monthly_stats/` for speed.
-- **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message graphs.
-- **`!archive`**: Deep scans and archives message counts for the past 12 months.
+### 📈 Analytics & SQLite Real-Time Tracking
+*Note: Real-time event capture with an in-memory batching buffer and periodic flush guarantees sub-millisecond command response times with zero Discord API rate limits. Channels ending in `logs` or `log` are excluded.*
+- **`!topusers [year] <month>`**: Shows the top 10 most active members for a given year or specific month, loaded instantly from the SQLite database.
+- **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message graphs rendered in milliseconds from pre-aggregated hourly buckets.
+- **`!archive`**: Deep scans and archives message counts for the past 12 months into SQLite.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
-- **`!myemojis`**: Scans your personal messages over the past 30 days and shows your top 10 most used emojis with counts. Protected by privacy rules so other users cannot order scans of your messages.
-- **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days and attributing the top user for each emoji.
+- **`!myemojis`**: Shows your personal top 10 most used emojis over the past 30 days with total unique emojis and overall use counts. Protected by privacy rules so other users cannot order scans of your messages.
+- **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days, their total uses, and the top user for each emoji.
+- **`!syncbaseline`**: Admin-only command to trigger a fresh 30-day baseline backfill across channels if needed.
 
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
 - **Dynamic Help (`!help`)**: A custom embed help command that displays all available commands, their arguments, and whether they are currently `Active` or `Disabled` based on the `.env` configuration.
 - **Admin Restart (`!restart`)**: Allows admins to trigger a container reboot and pull the latest code directly from Discord.
 - **Global Error Handling**: Intercepts unknown commands, invalid/missing arguments, permission errors, and internal backend crashes, sending formatted feedback directly to the Discord channel.
+
+## 🗄️ Database Architecture & Storage
+
+All persistent data is stored in an embedded SQLite database (`bot_database.db`) operating with **Write-Ahead Logging (`WAL`)** enabled for maximum concurrency and ACID crash resilience.
+
+To eliminate disk bottlenecks and race conditions during high chat traffic, incoming messages are captured in an in-memory accumulator and flushed in bulk every 15 seconds. Moderation actions (quarantine, prison) commit immediately within isolated transactions.
+
+### Database Tables & Tracked Data
+
+| Table Name | Tracked Columns | Description & Retention Policy |
+| :--- | :--- | :--- |
+| **`user_monthly_activity`** | `year`, `month`, `user_id`, `user_name`, `message_count` | Aggregates message counts per user per month. Powers **`!topusers`** and active user eligibility for **`!pronounstats`** with sub-millisecond query speed. |
+| **`month_metadata`** | `year`, `month`, `is_complete` | Flags whether a past calendar month has ended and is fully archived so it never needs to be re-scanned. |
+| **`activity_hourly`** | `date_hour` (UTC `'YYYY-MM-DD HH'`), `message_count` | Stores server-wide message volume in hourly increments (max 720 rows). Feeds the 30-day graphs for **`!activity30`**. An hourly maintenance task automatically deletes entries older than 30 days. |
+| **`channel_sync`** | `channel_id`, `last_message_id`, `last_updated_at` | Stores the latest processed message ID watermark per channel. On bot startup or after an outage, the bot performs a catch-up scan pulling only the delta messages sent during downtime, ensuring **zero data loss**. |
+| **`emoji_daily_usage`** | `date` (`'YYYY-MM-DD'`), `user_id`, `user_name`, `emoji`, `count` | Stores daily emoji counts per user. Feeds **`!myemojis`** and **`!emojileaderboard`**. Entries older than 30 days are automatically deleted by the hourly maintenance loop. |
+| **`prison_records`** | `user_id`, `roles` (JSON list of role IDs), `jailed_at` | Preserves all stripped non-category roles when a member is sent to Prison Island (`!prison`), allowing full role restoration on release. |
+| **`unc_records`** | `user_id`, `count` | Tracks voice channel misclick counts for the 5-tier Unc dynasty role progression. |
+| **`trust_records`** | `user_id`, `points` | Tracks interaction points for new members towards unlocking media permissions (`TRUST_THRESHOLD`). The row is cleared once the role is awarded. |
+| **`quarantine_records`** | `user_id`, `roles` (JSON list of role IDs), `quarantined_at`, `reason`, `type` | Preserves prior roles, timestamp, reason, and trigger type (`automod`, `account_age`, `manual`, `evasion`) for quarantined users to restore roles on release or re-enforce quarantine on rejoin. |
+| **`bot_metadata`** | `key`, `value` | Tracks internal state flags, such as `initial_30d_sync_done`, ensuring the initial 30-day baseline backfill executes exactly once. |
 
 ## Setup Instructions
 

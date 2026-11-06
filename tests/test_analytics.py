@@ -1,6 +1,8 @@
 import os
 import sys
 import unittest
+import tempfile
+import shutil
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta, timezone
 
@@ -10,6 +12,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import discord
 from discord.ext import commands
 from cogs.analytics import Analytics, extract_emojis, EMOJI_SELF_LIMIT, EMOJI_LEADERBOARD_LIMIT
+from database import Database
 
 
 class TestAnalyticsEmojiExtraction(unittest.TestCase):
@@ -59,8 +62,12 @@ class TestEmojiCommands(unittest.IsolatedAsyncioTestCase):
     """Unit tests for the !myemojis and !emojileaderboard commands."""
 
     async def asyncSetUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.test_db_file = os.path.join(self.test_dir, "test_analytics.db")
+        self.test_db = Database(self.test_db_file)
+
         self.bot = MagicMock(spec=commands.Bot)
-        self.cog = Analytics(self.bot)
+        self.cog = Analytics(self.bot, db=self.test_db)
 
         # Mock author
         self.author = MagicMock(spec=discord.Member)
@@ -109,6 +116,10 @@ class TestEmojiCommands(unittest.IsolatedAsyncioTestCase):
         self.ctx.guild = self.guild
         self.ctx.author = self.author
         self.ctx.send = AsyncMock()
+
+    async def asyncTearDown(self):
+        await self.test_db.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def _create_mock_message(self, author, content, days_ago=1):
         msg = MagicMock(spec=discord.Message)

@@ -10,6 +10,7 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 import discord
 from discord.ext import commands
 from cogs.moderation import Moderation, QuarantineReleaseButton, QUARANTINE_FILE, PRISON_FILE
+from database import Database
 from utils import load_json_data, save_json_data
 
 
@@ -21,17 +22,10 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.orig_q_file = QUARANTINE_FILE
         self.orig_p_file = PRISON_FILE
 
-        self.test_q_file = os.path.join(self.test_dir, "test_quarantine_data.json")
-        self.test_p_file = os.path.join(self.test_dir, "test_prison_data.json")
-
-        save_json_data(self.test_q_file, {})
-        save_json_data(self.test_p_file, {})
-
-        # Patch module-level file constants
-        self.patch_q = patch("cogs.moderation.QUARANTINE_FILE", self.test_q_file)
-        self.patch_p = patch("cogs.moderation.PRISON_FILE", self.test_p_file)
-        self.patch_q.start()
-        self.patch_p.start()
+        self.test_db_file = os.path.join(self.test_dir, "test_moderation.db")
+        if os.path.exists(self.test_db_file):
+            os.remove(self.test_db_file)
+        self.test_db = Database(self.test_db_file)
 
         # Mock Bot
         self.bot = MagicMock(spec=commands.Bot)
@@ -40,7 +34,7 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.bot.get_guild.return_value = None
 
         # Instantiate Cog
-        self.cog = Moderation(self.bot)
+        self.cog = Moderation(self.bot, db=self.test_db)
         self.cog.quarantine_role_id = 999
         self.cog.inmate_role_id = 888
         self.cog.quarantine_channel_id = 111
@@ -107,13 +101,15 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.guild.get_channel.side_effect = get_channel_mock
 
     async def asyncTearDown(self):
-        self.patch_q.stop()
-        self.patch_p.stop()
-        for f in [self.test_q_file, self.test_p_file]:
+        await self.test_db.close()
+        for f in [self.test_db_file, self.test_db_file + "-wal", self.test_db_file + "-shm"]:
             if os.path.exists(f):
                 os.remove(f)
         if os.path.exists(self.test_dir):
-            os.rmdir(self.test_dir)
+            try:
+                os.rmdir(self.test_dir)
+            except OSError:
+                pass
 
     def _create_member(self, user_id=12345, name="Newbie", created_days_ago=10, joined_days_ago=2, roles=None):
         member = MagicMock(spec=discord.Member)
@@ -188,10 +184,10 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.assertIn(self.q_role, edited_roles)
         self.assertNotIn(self.user_role1, edited_roles)
 
-        # Prior roles saved in quarantine_data.json
-        q_data = load_json_data(self.test_q_file)
-        self.assertIn(str(member.id), q_data)
-        saved_roles = q_data[str(member.id)]["roles"]
+        # Prior roles saved in database
+        q_record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertIsNotNone(q_record)
+        saved_roles = q_record["roles"]
         self.assertIn(self.user_role1.id, saved_roles)
         self.assertIn(self.user_role2.id, saved_roles)
 
@@ -254,9 +250,9 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn(self.user_role1, edited_roles)
 
         # Added to ledger with type automod
-        q_data = load_json_data(self.test_q_file)
-        self.assertIn(str(member.id), q_data)
-        self.assertEqual(q_data[str(member.id)]["type"], "automod")
+        q_record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertIsNotNone(q_record)
+        self.assertEqual(q_record["type"], "automod")
 
     async def test_automod_already_quarantined_user_in_ledger_ignored(self):
         """User already in quarantine ledger who triggers AutoMod in quarantine does not trigger a re-quarantine."""
@@ -268,14 +264,12 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.guild.get_member.return_value = member
 
         # User is already recorded in quarantine data
-        save_json_data(self.test_q_file, {
-            str(member.id): {
-                "roles": [self.user_role1.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Previous quarantine",
-                "type": "automod",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id],
+            reason="Previous quarantine",
+            q_type="automod",
+        )
 
         execution = MagicMock(spec=discord.AutoModAction)
         execution.guild_id = self.guild.id
@@ -319,14 +313,12 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
 
         # Save prior roles in quarantine ledger with type automod
-        save_json_data(self.test_q_file, {
-            str(member.id): {
-                "roles": [self.user_role1.id, self.user_role2.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Test",
-                "type": "automod",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id, self.user_role2.id],
+            reason="Test",
+            q_type="automod",
+        )
 
         success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
         self.assertTrue(success)
@@ -344,9 +336,8 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.assertIn("previous roles and server access have been restored", dm_content)
         self.assertIn("StaffMod", dm_content)
 
-        # Removed from json
-        q_data = load_json_data(self.test_q_file)
-        self.assertNotIn(str(member.id), q_data)
+        # Removed from database
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
 
         # Announced in quarantine channel
         self.quarantine_channel.send.assert_awaited()
@@ -370,14 +361,12 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
 
         # Save partial onboarding roles clicked on join
-        save_json_data(self.test_q_file, {
-            str(member.id): {
-                "roles": [self.user_role1.id, self.user_role2.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Account too new",
-                "type": "account_age",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id, self.user_role2.id],
+            reason="Account too new",
+            q_type="account_age",
+        )
 
         success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
         self.assertTrue(success)
@@ -404,14 +393,12 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         member.send.side_effect = discord.Forbidden(MagicMock(), "Cannot send messages to this user")
         staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
 
-        save_json_data(self.test_q_file, {
-            str(member.id): {
-                "roles": [self.user_role1.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Test",
-                "type": "automod",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id],
+            reason="Test",
+            q_type="automod",
+        )
 
         success, msg = await self.cog.release_quarantined_member(member, released_by=staff)
         self.assertTrue(success)
@@ -488,9 +475,9 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
 
         # Roles stripped and saved
         member.edit.assert_awaited_once()
-        q_data = load_json_data(self.test_q_file)
-        self.assertIn(str(member.id), q_data)
-        self.assertEqual(q_data[str(member.id)]["type"], "manual")
+        q_record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertIsNotNone(q_record)
+        self.assertEqual(q_record["type"], "manual")
 
         # Exactly 1 message in quarantine channel: mentions user, no reason field, no duplicate ctx.send
         self.quarantine_channel.send.assert_awaited_once()
@@ -567,33 +554,28 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         member_after.add_roles = AsyncMock()
 
         # Save prior roles with type automod
-        save_json_data(self.test_q_file, {
-            str(member_after.id): {
-                "roles": [self.user_role1.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Test UI removal",
-                "type": "automod",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member_after.id,
+            roles=[self.user_role1.id],
+            reason="Test UI removal",
+            q_type="automod",
+        )
 
         await self.cog.on_member_update(member_before, member_after)
 
         member_after.add_roles.assert_awaited_once_with(self.user_role1, reason="Quarantine role manually removed: Restored prior roles.")
         member_after.send.assert_awaited_once()
-        q_data = load_json_data(self.test_q_file)
-        self.assertNotIn(str(member_after.id), q_data)
+        self.assertFalse(await self.cog.db.has_quarantine_record(member_after.id))
 
     async def test_quarantine_evasion_on_rejoin(self):
         """User in quarantine who leaves and rejoins gets dragged back to quarantine."""
         member = self._create_member(created_days_ago=50, joined_days_ago=0)
 
-        save_json_data(self.test_q_file, {
-            str(member.id): {
-                "roles": [self.user_role1.id],
-                "quarantined_at": datetime.now().isoformat(),
-                "reason": "Prior quarantine",
-            }
-        })
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id],
+            reason="Prior quarantine",
+        )
 
         with patch("asyncio.sleep", new_callable=AsyncMock):
             self.guild.get_member.return_value = member

@@ -7,13 +7,12 @@ from discord.ext import commands
 
 from utils import (
     ensure_json_file,
-    load_json_data,
-    save_json_data,
     get_env_int,
     get_env_float,
     get_env_int_list,
     is_env_enabled,
 )
+from database import db as default_db, Database
 
 # ---------------------------------------------------------
 # MODULE-LEVEL CONSTANTS
@@ -98,8 +97,9 @@ class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], templat
 
 
 class Moderation(commands.Cog):
-    def __init__(self, bot):
+    def __init__(self, bot, db: Database = None):
         self.bot = bot
+        self.db = db or default_db
 
         # Runtime Memory Trackers
         self.voice_join_times = {}
@@ -107,7 +107,7 @@ class Moderation(commands.Cog):
         self.trust_cooldowns = {}
         self.channel_deletions = {}
 
-        # Async Locks for File I/O Safety
+        # Async Locks for In-Memory Safety
         self.prison_lock = asyncio.Lock()
         self.unc_lock = asyncio.Lock()
         self.trust_lock = asyncio.Lock()
@@ -139,13 +139,8 @@ class Moderation(commands.Cog):
         self.anti_nuke_limit = get_env_int("ANTI_NUKE_CHANNEL_LIMIT", 2)
         self.anti_nuke_window = get_env_int("ANTI_NUKE_WINDOW_SECONDS", 600)
 
-        # Initialize JSON Ledgers
-        ensure_json_file(PRISON_FILE)
-        ensure_json_file(UNC_FILE)
-        ensure_json_file(TRUST_FILE)
-        ensure_json_file(QUARANTINE_FILE)
-
     async def cog_load(self):
+        await self.db.initialize()
         self.bot.add_dynamic_items(QuarantineReleaseButton)
 
     async def cog_unload(self):
@@ -327,13 +322,8 @@ class Moderation(commands.Cog):
                         self.voice_join_times.pop(member.id, None)
                         return
 
-                    # 1. Safely load and increment count
-                    async with self.unc_lock:
-                        unc_data = load_json_data(UNC_FILE)
-                        uid = str(member.id)
-                        current_count = unc_data.get(uid, 0) + 1
-                        unc_data[uid] = current_count
-                        save_json_data(UNC_FILE, unc_data)
+                    # 1. Safely increment count in SQLite
+                    current_count = await self.db.increment_unc_count(member.id)
 
                     # 2. Determine level and target role ID
                     if current_count < 5:
@@ -409,16 +399,14 @@ class Moderation(commands.Cog):
         user_id_str = str(member.id)
 
         async with self.prison_lock:
-            data = load_json_data(PRISON_FILE)
-            if user_id_str in data:
+            if await self.db.has_prison_record(member.id):
                 return await ctx.send(f"⚠️ {member.mention} is already in prison.")
 
             roles_to_save = [
                 role.id for role in member.roles
                 if role.id != ctx.guild.id and role.id not in self.category_role_ids and not role.managed
             ]
-            data[user_id_str] = roles_to_save
-            save_json_data(PRISON_FILE, data)
+            await self.db.set_prison_record(member.id, roles_to_save)
 
         new_roles = [role for role in member.roles if role.id in self.category_role_ids]
         inmate_role = ctx.guild.get_role(self.inmate_role_id)
@@ -491,13 +479,13 @@ class Moderation(commands.Cog):
         now = datetime.now()
 
         async with self.quarantine_lock:
-            q_data = load_json_data(QUARANTINE_FILE)
             already_quarantined = any(r.id == self.quarantine_role_id for r in member.roles)
-            if (already_quarantined or uid in q_data) and not is_evasion:
+            in_q_data = await self.db.has_quarantine_record(member.id)
+            if (already_quarantined or in_q_data) and not is_evasion:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Ignored quarantine request for {member.name}: already in quarantine.")
                 return False
 
-            if uid not in q_data:
+            if not in_q_data:
                 roles_to_save = [
                     role.id for role in member.roles
                     if role.id != member.guild.id
@@ -506,22 +494,21 @@ class Moderation(commands.Cog):
                     and role.id != self.quarantine_role_id
                 ]
                 effective_type = quarantine_type or ("automod" if is_automod else ("evasion" if is_evasion else "account_age"))
-                q_data[uid] = {
-                    "roles": roles_to_save,
-                    "quarantined_at": now.isoformat(),
-                    "reason": reason,
-                    "type": effective_type,
-                }
-                save_json_data(QUARANTINE_FILE, q_data)
+                await self.db.set_quarantine_record(
+                    member.id,
+                    roles_to_save,
+                    reason=reason,
+                    q_type=effective_type,
+                    quarantined_at=now.isoformat(),
+                )
             else:
-                effective_type = q_data[uid].get("type", "account_age") if isinstance(q_data[uid], dict) else "account_age"
+                record = await self.db.get_quarantine_record(member.id)
+                effective_type = record.get("type", "account_age") if record else "account_age"
 
         # Clear prison data if present to prioritize strict quarantine
         async with self.prison_lock:
-            p_data = load_json_data(PRISON_FILE)
-            if uid in p_data:
-                del p_data[uid]
-                save_json_data(PRISON_FILE, p_data)
+            deleted_roles = await self.db.delete_prison_record(member.id)
+            if deleted_roles is not None:
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Cleared prison data for {member.name} to enforce strict quarantine.")
 
         new_roles = [role for role in member.roles if role.id in self.category_role_ids]
@@ -622,13 +609,10 @@ class Moderation(commands.Cog):
         now = datetime.now()
 
         async with self.quarantine_lock:
-            q_data = load_json_data(QUARANTINE_FILE)
-            in_q_data = uid in q_data
+            saved_entry = await self.db.delete_quarantine_record(member.id)
+            in_q_data = saved_entry is not None
             if not is_quarantined and not in_q_data:
                 return False, f"{member.mention} is not currently in quarantine."
-
-            saved_entry = q_data.pop(uid, None)
-            save_json_data(QUARANTINE_FILE, q_data)
 
         if isinstance(saved_entry, dict):
             q_type = saved_entry.get("type", "account_age")
@@ -713,16 +697,14 @@ class Moderation(commands.Cog):
         if not is_env_enabled("ENABLE_MODERATION"):
             return
 
-        uid = str(member.id)
         is_quarantined = any(r.id == self.quarantine_role_id for r in member.roles)
 
         async with self.quarantine_lock:
-            q_data = load_json_data(QUARANTINE_FILE)
-            in_q_data = uid in q_data
+            in_q_data = await self.db.has_quarantine_record(member.id)
 
         async with self.prison_lock:
-            p_data = load_json_data(PRISON_FILE)
-            is_inmate = uid in p_data or any(r.id == self.inmate_role_id for r in member.roles)
+            in_prison_db = await self.db.has_prison_record(member.id)
+            is_inmate = in_prison_db or any(r.id == self.inmate_role_id for r in member.roles)
 
         # 1. Quarantine Release
         if is_quarantined or in_q_data:
@@ -737,11 +719,9 @@ class Moderation(commands.Cog):
                 return await ctx.send("🚫 Prison command is disabled.")
 
             async with self.prison_lock:
-                p_data = load_json_data(PRISON_FILE)
-                if uid not in p_data:
+                saved_role_ids = await self.db.delete_prison_record(member.id)
+                if saved_role_ids is None:
                     return await ctx.send(f"❌ {member.mention} has no saved roles in prison.")
-                saved_role_ids = p_data.pop(uid)
-                save_json_data(PRISON_FILE, p_data)
 
             roles_to_restore = [ctx.guild.default_role]
             for role in member.roles:
@@ -799,12 +779,10 @@ class Moderation(commands.Cog):
         uid = str(member.id)
 
         async with self.quarantine_lock:
-            q_data = load_json_data(QUARANTINE_FILE)
-            was_quarantined = uid in q_data
+            was_quarantined = await self.db.has_quarantine_record(member.id)
 
         async with self.prison_lock:
-            p_data = load_json_data(PRISON_FILE)
-            is_inmate = uid in p_data
+            is_inmate = await self.db.has_prison_record(member.id)
 
         # 1. Auto-Quarantine (Account too new)
         if needs_quarantine:
@@ -942,12 +920,9 @@ class Moderation(commands.Cog):
 
         # 1. Staff manually unquarantined the user by removing the role in Discord UI
         if had_q and not has_q:
-            uid = str(after.id)
             async with self.quarantine_lock:
-                q_data = load_json_data(QUARANTINE_FILE)
-                if uid in q_data:
-                    saved_entry = q_data.pop(uid)
-                    save_json_data(QUARANTINE_FILE, q_data)
+                saved_entry = await self.db.delete_quarantine_record(after.id)
+                if saved_entry:
                     q_type = saved_entry.get("type", "account_age") if isinstance(saved_entry, dict) else "account_age"
                     saved_role_ids = saved_entry.get("roles", []) if isinstance(saved_entry, dict) else saved_entry
 
@@ -1036,11 +1011,9 @@ class Moderation(commands.Cog):
 
         self.trust_cooldowns[message.author.id] = now
 
-        # 3. Safely lock file operations to prevent race conditions
+        # 3. Safely update trust points in SQLite
         async with self.trust_lock:
-            trust_data = load_json_data(TRUST_FILE)
-            uid = str(message.author.id)
-            current_points = trust_data.get(uid, 0) + 1
+            current_points = await self.db.get_trust_points(message.author.id) + 1
 
             # 4. Check if they reached the threshold
             if current_points >= self.trust_threshold:
@@ -1052,8 +1025,7 @@ class Moderation(commands.Cog):
                             reason="Reached interaction threshold for media permissions.",
                         )
 
-                        trust_data.pop(uid, None)
-                        save_json_data(TRUST_FILE, trust_data)
+                        await self.db.delete_trust_record(message.author.id)
 
                         try:
                             await message.author.send(
@@ -1067,8 +1039,7 @@ class Moderation(commands.Cog):
                     except discord.Forbidden:
                         print(f"⚠️ Could not assign Trusted Media role to {message.author.name}: Bot lacks permissions.")
             else:
-                trust_data[uid] = current_points
-                save_json_data(TRUST_FILE, trust_data)
+                await self.db.set_trust_points(message.author.id, current_points)
 
     # ---------------------------------------------------------
     # ANTI-NUKE SYSTEM (Channel Deletion Limits)

@@ -5,6 +5,7 @@ import discord
 from discord.ext import commands
 
 from utils import get_env_int, is_env_enabled
+from database import db
 
 load_dotenv()
 
@@ -39,6 +40,8 @@ async def load_extensions():
 
 @bot.event
 async def setup_hook():
+    await db.initialize()
+    await db.auto_migrate_legacy_json()
     await load_extensions()
 
 
