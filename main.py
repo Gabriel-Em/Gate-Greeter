@@ -122,11 +122,6 @@ async def help_command(ctx):
             "active": analytics_enabled and is_env_enabled("ENABLE_CMD_ACTIVITY30"),
         },
         {
-            "name": "!archive",
-            "desc": "Deep scans and archives message counts for the past 12 months.",
-            "active": analytics_enabled and is_env_enabled("ENABLE_CMD_ARCHIVE"),
-        },
-        {
             "name": "!pronounstats <year>",
             "desc": f"Graphs demographics for active users ({active_msg_threshold}+ messages/month) by pronoun roles.",
             "active": analytics_enabled and is_env_enabled("ENABLE_CMD_PRONOUNSTATS"),

@@ -22,7 +22,6 @@ from database import db as default_db, Database
 EXCLUDED_CHANNEL_SUFFIXES = ("logs", "log")
 EXCLUDED_CHANNEL_SUFFIX = EXCLUDED_CHANNEL_SUFFIXES
 
-ARCHIVE_MONTHS_COUNT = 12
 ACTIVITY_DAYS_WINDOW = 30
 TOP_USERS_LIMIT = 10
 STATUS_UPDATE_INTERVAL = 5
@@ -88,8 +87,6 @@ class Analytics(commands.Cog):
         self.bot = bot
         self.db = db or default_db
 
-        # Async lock to prevent concurrent scraping/writing collisions
-        self.archive_lock = asyncio.Lock()
         self.is_syncing = False
 
         # In-Memory Buffers for Batch Writing
@@ -403,29 +400,6 @@ class Analytics(commands.Cog):
     # ---------------------------------------------------------
     # ANALYTICS COMMANDS
     # ---------------------------------------------------------
-    @commands.command(name="archive")
-    async def archive(self, ctx):
-        if not self._is_enabled("ENABLE_CMD_ARCHIVE"):
-            return
-
-        status_msg = await ctx.send(
-            f"🗄️ Initializing {ARCHIVE_MONTHS_COUNT}-month deep scan. This will take a while..."
-        )
-        now = datetime.now()
-
-        for i in range(ARCHIVE_MONTHS_COUNT):
-            y = now.year + (now.month - 1 - i) // 12
-            m = (now.month - 1 - i) % 12 + 1
-
-            if await self.db.is_month_complete(y, m):
-                continue
-
-            prefix = f"🗄️ Scraping data for {y}-{m:02d} (Month {i + 1} of {ARCHIVE_MONTHS_COUNT})"
-            await status_msg.edit(content=f"{prefix}...")
-            await self._scrape_month_data(ctx.guild, y, m, status_msg, prefix)
-
-        await status_msg.edit(content=f"✅ {ARCHIVE_MONTHS_COUNT}-month data archive is up to date in SQLite!")
-
     @commands.command(name="syncbaseline", aliases=["backfill30"])
     @commands.has_permissions(administrator=True)
     async def syncbaseline(self, ctx):

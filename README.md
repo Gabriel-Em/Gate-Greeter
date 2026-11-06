@@ -31,7 +31,6 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 *Channels ending in `logs` or `log` are excluded from tracking.*
 - **`!topusers [year] <month>`**: Displays the top 10 most active members for a given year or specific month.
 - **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message activity graphs.
-- **`!archive`**: Scans and archives message history for the past 12 months into the database.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
 - **`!myemojis`**: Displays your top 10 most used emojis over the past 30 days, along with total unique emojis and total usage counts.
 - **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days, their total uses, and the top user for each emoji.
@@ -82,7 +81,6 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    ENABLE_BACKUP=True
 
    # Granular Analytics Commands
-   ENABLE_CMD_ARCHIVE=True
    ENABLE_CMD_ACTIVITY30=True
    ENABLE_CMD_TOPUSERS=True
    ENABLE_CMD_PRONOUNSTATS=True

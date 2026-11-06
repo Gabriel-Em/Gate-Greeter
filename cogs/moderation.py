@@ -148,131 +148,151 @@ class Moderation(commands.Cog):
 
     @commands.Cog.listener()
     async def on_ready(self):
-        unc_tier_names = ["Unc", "Grand Unc", "Great-Grand Unc", "Ancestral Unc", "The First Unc"]
-
         for guild in self.bot.guilds:
             me = guild.me
             perms = me.guild_permissions if me else None
             top_role = me.top_role if me else None
             is_admin = perms.administrator if perms else False
 
-            print("\n" + "=" * 70)
-            print(f"[Audit] Comprehensive Setup Audit for '{guild.name}' (ID: {guild.id})")
-            print("=" * 70)
-            if me:
-                print(f"Bot Identity: {me} | Top Role: @{top_role.name} (Position: {top_role.position})")
+            top_role_name = f"@{top_role.name}" if top_role else "None"
+            print(f"\n[Audit] Setup check for '{guild.name}' (Bot: {me}, Top Role: {top_role_name}):")
 
-            # 1. Guild-Level Bot Permissions
-            print("\n[Guild Permissions]")
-            if perms:
-                print(f"  - Manage Server (manage_guild):    {'✅ Granted' if perms.manage_guild else '❌ MISSING (Required for AutoMod execution events!)'}")
-                print(f"  - Manage Roles (manage_roles):      {'✅ Granted' if perms.manage_roles else '❌ MISSING (Required to assign/remove roles!)'}")
-                print(f"  - View Audit Log (view_audit_log):  {'✅ Granted' if perms.view_audit_log else '❌ MISSING (Required for anti-nuke & evasion tracking!)'}")
-                print(f"  - Kick Members (kick_members):      {'✅ Granted' if perms.kick_members else '⚠️ Not granted (Anti-nuke cannot kick rogue bots)'}")
-                print(f"  - Administrator:                    {'✅ True (Overrides channel restrictions)' if is_admin else 'False (Standard permissions apply)'}")
+            # 1. Guild Permissions
+            if not perms:
+                perm_summary = "❌ Bot member object unresolved in guild"
+            elif is_admin:
+                perm_summary = "✅ Administrator (all permissions granted)"
             else:
-                print("  ❌ Could not resolve bot member object in guild.")
+                required = [
+                    ("manage_guild", "Manage Server"),
+                    ("manage_roles", "Manage Roles"),
+                    ("view_audit_log", "View Audit Log"),
+                    ("kick_members", "Kick Members"),
+                ]
+                missing = [name for attr, name in required if not getattr(perms, attr, False)]
+                if not missing:
+                    perm_summary = "✅ All required permissions granted"
+                else:
+                    perm_summary = f"❌ Missing required: {', '.join(missing)}"
+            print(f"  • Permissions:   {perm_summary}")
 
             # 2. Configured Channels & Access
-            print("\n[Channels & Access]")
             channels_to_check = [
-                ("Quarantine Channel", self.quarantine_channel_id),
-                ("Quarantine Logs", self.quarantine_logs_channel_id),
-                ("General Chat", self.general_channel_id),
-                ("Mods Chat", self.mods_chat_id),
+                ("Quarantine", self.quarantine_channel_id),
+                ("Logs", self.quarantine_logs_channel_id),
+                ("General", self.general_channel_id),
+                ("Mods", self.mods_chat_id),
             ]
+            chan_missing = []
+            chan_perm_issues = []
+            configured_channels = 0
             for label, cid in channels_to_check:
                 if not cid:
-                    print(f"  - {label}: ⚠️ Not configured in .env")
                     continue
+                configured_channels += 1
                 ch = guild.get_channel(cid)
                 if not ch:
-                    print(f"  - {label} (ID: {cid}): ❌ NOT FOUND in guild")
+                    chan_missing.append(label)
                     continue
 
                 if me and hasattr(ch, "permissions_for"):
                     cp = ch.permissions_for(me)
                     can_view = cp.view_channel or is_admin
                     can_send = cp.send_messages or is_admin
-                    if can_view and can_send:
-                        status = "✅ Accessible (View: ✅, Send: ✅)"
-                    else:
-                        issues = []
+                    if not can_view or not can_send:
+                        reasons = []
                         if not can_view:
-                            issues.append("View: ❌")
+                            reasons.append("no view")
                         if not can_send:
-                            issues.append("Send: ❌")
-                        status = f"⚠️ Limited ({', '.join(issues)})"
-                else:
-                    status = "✅ Found"
-                print(f"  - {label} (ID: {cid}): #{ch.name} -> {status}")
+                            reasons.append("no send")
+                        chan_perm_issues.append(f"{label} ({', '.join(reasons)})")
+
+            chan_issues = []
+            if chan_missing:
+                chan_issues.append(f"{', '.join(chan_missing)} (not found)")
+            if chan_perm_issues:
+                chan_issues.append("; ".join(chan_perm_issues))
+
+            if not configured_channels:
+                chan_summary = "⚠️ None configured in .env"
+            elif not chan_issues:
+                chan_summary = f"✅ All {configured_channels} channels accessible"
+            else:
+                accessible_count = configured_channels - len(chan_missing) - len(chan_perm_issues)
+                chan_summary = f"⚠️ {accessible_count}/{configured_channels} accessible — Issues: {'; '.join(chan_issues)}"
+            print(f"  • Channels:      {chan_summary}")
 
             # 3. Actionable Managed Roles & Hierarchy
-            print("\n[Managed Roles & Hierarchy]")
+            managed_missing = []
+            managed_hier = []
             single_roles = [
-                ("Quarantine Role", self.quarantine_role_id),
-                ("Inmate Role", self.inmate_role_id),
-                ("Trusted Role", self.trusted_role_id),
+                ("Quarantine", self.quarantine_role_id),
+                ("Inmate", self.inmate_role_id),
+                ("Trusted", self.trusted_role_id),
             ]
             for label, rid in single_roles:
                 if not rid:
-                    print(f"  - {label}: ⚠️ Not configured in .env")
                     continue
                 role = guild.get_role(rid)
                 if not role:
-                    print(f"  - {label} (ID: {rid}): ❌ NOT FOUND in guild")
-                    continue
+                    managed_missing.append(label)
+                elif me and top_role and not is_admin and top_role <= role:
+                    managed_hier.append(label)
 
-                if me and top_role:
-                    if is_admin or top_role > role:
-                        hier_status = "✅ Manageable (Hierarchy OK)"
-                    else:
-                        hier_status = f"❌ Hierarchy error: Role is equal or higher than bot's top role (@{top_role.name}); bot CANNOT assign it!"
-                else:
-                    hier_status = "✅ Found"
-                print(f"  - {label} (ID: {rid}): @{role.name} -> {hier_status}")
+            managed_issues = []
+            if managed_missing:
+                managed_issues.append(f"{', '.join(managed_missing)} (not found)")
+            if managed_hier:
+                managed_issues.append(f"{', '.join(managed_hier)} (hierarchy error: above bot)")
 
-            # UNC Role Tiers
-            print(f"  - UNC Roles ({len(self.unc_role_ids)} configured):")
+            unc_total = len(self.unc_role_ids)
+            unc_ok = 0
+            unc_missing = []
+            unc_hier_errors = []
             if not self.unc_role_ids:
-                print("      ⚠️ None configured in .env (UNC_ROLE_IDS)")
+                managed_issues.append("UNC (none configured)")
             else:
                 for idx, rid in enumerate(self.unc_role_ids):
-                    expected_tier = unc_tier_names[idx] if idx < len(unc_tier_names) else f"Tier {idx+1}"
                     role = guild.get_role(rid)
                     if not role:
-                        print(f"      Tier {idx+1} ({expected_tier}, ID: {rid}): ❌ NOT FOUND")
-                        continue
-                    if me and top_role and not is_admin and top_role <= role:
-                        hier = "❌ Bot role is below this tier; cannot assign!"
+                        unc_missing.append(f"T{idx+1}")
+                    elif me and top_role and not is_admin and top_role <= role:
+                        unc_hier_errors.append(f"T{idx+1}")
                     else:
-                        hier = "✅ OK"
-                    print(f"      Tier {idx+1} ({expected_tier}, ID: {rid}): @{role.name} -> {hier}")
+                        unc_ok += 1
+
+                if unc_missing:
+                    managed_issues.append(f"UNC {', '.join(unc_missing)} (not found)")
+                if unc_hier_errors:
+                    managed_issues.append(f"UNC {', '.join(unc_hier_errors)} (hierarchy error)")
+
+            if not managed_issues:
+                managed_summary = f"✅ Quarantine, Inmate, Trusted & UNC ({unc_ok}/{unc_total} tiers) manageable"
+            else:
+                managed_summary = f"❌ Issues: {'; '.join(managed_issues)}"
+            print(f"  • Managed Roles: {managed_summary}")
 
             # 4. Reference Role Sets
-            print("\n[Reference Roles]")
             ref_role_sets = [
-                ("Staff Roles", self.staff_role_ids),
-                ("Category Divider Roles", self.category_role_ids),
-                ("Pronoun Roles", self.pronoun_role_ids),
+                ("Staff", self.staff_role_ids),
+                ("Dividers", self.category_role_ids),
+                ("Pronouns", self.pronoun_role_ids),
             ]
+            ref_counts = []
+            ref_issues = []
             for label, rids in ref_role_sets:
                 if not rids:
-                    print(f"  - {label}: ⚠️ None configured in .env")
                     continue
-                found_roles = [guild.get_role(rid) for rid in rids if guild.get_role(rid)]
-                missing_count = len(rids) - len(found_roles)
-                status = f"✅ {len(found_roles)}/{len(rids)} found"
-                if missing_count > 0:
-                    status += f" (⚠️ {missing_count} ID(s) not found in guild)"
-                print(f"  - {label}: {status}")
-                if found_roles:
-                    names_str = ", ".join(f"@{r.name}" for r in found_roles[:6])
-                    if len(found_roles) > 6:
-                        names_str += f" (+{len(found_roles) - 6} more)"
-                    print(f"      Names: {names_str}")
+                found = sum(1 for rid in rids if guild.get_role(rid))
+                ref_counts.append(f"{label}: {found}/{len(rids)}")
+                if found < len(rids):
+                    ref_issues.append(f"{label} ({len(rids) - found} missing)")
 
-            print("=" * 70 + "\n")
+            if not ref_issues:
+                ref_summary = f"✅ Found: {', '.join(ref_counts)}"
+            else:
+                ref_summary = f"⚠️ {', '.join(ref_counts)} — Missing: {'; '.join(ref_issues)}"
+            print(f"  • Role Sets:     {ref_summary}\n")
 
     def get_quarantine_channel(self, guild: discord.Guild) -> discord.TextChannel | None:
         if self.quarantine_channel_id:
