@@ -7,7 +7,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 ### 🛡️ Moderation & Security System
 - **Manual Quarantine (`!quarantine @user`)**: Allows staff with `manage_roles` permissions to manually quarantine a user, securely snapshotting all their roles, stripping non-category roles, assigning the Quarantine role, and posting an alert in the quarantine channel with a one-click release button.
 - **Prison & Quarantine Release (`!release @user` / `!unquarantine @user` / "🌿 Release into the Wild" Button)**:
-  - Easily releases quarantined users or prison inmates into the wild, automatically restoring all of their prior saved roles (`quarantine_data.json` / `prison_data.json`).
+  - Releases quarantined users or prison inmates, automatically restoring all of their prior saved roles.
   - Quarantine alerts in the quarantine channel include an interactive, persistent **"🌿 Release into the Wild"** button allowing staff to release quarantined users with a single click.
   - Staff manually removing the Quarantine role in Discord's UI also automatically triggers saved role restoration.
 - **Auto-Quarantine (New Account Protection)**: Automatically quarantines newly created accounts (default: `<= 7` days old, configurable via `QUARANTINE_ACCOUNT_AGE_DAYS`) upon joining, wiping non-category roles, assigning the Quarantine role (overriding any prior prison state), pinging the user with an explanation in the quarantine channel, and logging the action in the quarantine logs channel.
@@ -15,8 +15,8 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Evasion Prevention & Strict Role Enforcement**:
   - If an imprisoned or quarantined user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, drags them back into prison or quarantine, and logs the evasion attempt.
   - Monitors member role updates in real time (`on_member_update`) and immediately strips any unauthorized self-assigned or onboarding roles acquired while a user is in Quarantine or Prison.
-- **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s) and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently via `unc_data.json`, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
-- **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions (`trust_data.json`). Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
+- **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s) and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently in the database, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
+- **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions. Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
 - **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
 
 ### 🗂️ Server Backup & Snapshot
@@ -27,15 +27,15 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
   - Both files are saved locally in `backups/` and attached directly to the Discord response.
 - **Strict Zero-User-Data Policy**: Never stores messages, member lists, or user-specific channel overwrites (only `discord.Role` overwrites are recorded).
 
-### 📈 Analytics & SQLite Real-Time Tracking
-*Note: Real-time event capture with an in-memory batching buffer and periodic flush guarantees sub-millisecond command response times with zero Discord API rate limits. Channels ending in `logs` or `log` are excluded.*
-- **`!topusers [year] <month>`**: Shows the top 10 most active members for a given year or specific month, loaded instantly from the SQLite database.
-- **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message graphs rendered in milliseconds from pre-aggregated hourly buckets.
-- **`!archive`**: Deep scans and archives message counts for the past 12 months into SQLite.
+### 📈 Analytics
+*Channels ending in `logs` or `log` are excluded from tracking.*
+- **`!topusers [year] <month>`**: Displays the top 10 most active members for a given year or specific month.
+- **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message activity graphs.
+- **`!archive`**: Scans and archives message history for the past 12 months into the database.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
-- **`!myemojis`**: Shows your personal top 10 most used emojis over the past 30 days with total unique emojis and overall use counts. Protected by privacy rules so other users cannot order scans of your messages.
+- **`!myemojis`**: Displays your top 10 most used emojis over the past 30 days, along with total unique emojis and total usage counts.
 - **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days, their total uses, and the top user for each emoji.
-- **`!syncbaseline`**: Admin-only command to trigger a fresh 30-day baseline backfill across channels if needed.
+- **`!syncbaseline`**: Admin-only command to trigger a 30-day baseline backfill across channels.
 
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
@@ -43,20 +43,18 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Admin Restart (`!restart`)**: Allows admins to trigger a container reboot and pull the latest code directly from Discord.
 - **Global Error Handling**: Intercepts unknown commands, invalid/missing arguments, permission errors, and internal backend crashes, sending formatted feedback directly to the Discord channel.
 
-## 🗄️ Database Architecture & Storage
+## 🗄️ Database Storage
 
-All persistent data is stored in an embedded SQLite database (`bot_database.db`) operating with **Write-Ahead Logging (`WAL`)** enabled for maximum concurrency and ACID crash resilience.
-
-To eliminate disk bottlenecks and race conditions during high chat traffic, incoming messages are captured in an in-memory accumulator and flushed in bulk every 15 seconds. Moderation actions (quarantine, prison) commit immediately within isolated transactions.
+Persistent state is stored in an embedded SQLite database (`bot_database.db`) configured with Write-Ahead Logging (`WAL`). Message events are buffered in memory and flushed periodically in batches to reduce disk operations. Moderation actions (quarantine, prison) commit immediately in isolated transactions.
 
 ### Database Tables & Tracked Data
 
 | Table Name | Tracked Columns | Description & Retention Policy |
 | :--- | :--- | :--- |
-| **`user_monthly_activity`** | `year`, `month`, `user_id`, `user_name`, `message_count` | Aggregates message counts per user per month. Powers **`!topusers`** and active user eligibility for **`!pronounstats`** with sub-millisecond query speed. |
+| **`user_monthly_activity`** | `year`, `month`, `user_id`, `user_name`, `message_count` | Aggregates message counts per user per month. Powers **`!topusers`** and active user eligibility for **`!pronounstats`**. |
 | **`month_metadata`** | `year`, `month`, `is_complete` | Flags whether a past calendar month has ended and is fully archived so it never needs to be re-scanned. |
 | **`activity_hourly`** | `date_hour` (UTC `'YYYY-MM-DD HH'`), `message_count` | Stores server-wide message volume in hourly increments (max 720 rows). Feeds the 30-day graphs for **`!activity30`**. An hourly maintenance task automatically deletes entries older than 30 days. |
-| **`channel_sync`** | `channel_id`, `last_message_id`, `last_updated_at` | Stores the latest processed message ID watermark per channel. On bot startup or after an outage, the bot performs a catch-up scan pulling only the delta messages sent during downtime, ensuring **zero data loss**. |
+| **`channel_sync`** | `channel_id`, `last_message_id`, `last_updated_at` | Stores the latest processed message ID watermark per channel. On bot startup or after an outage, the bot performs a catch-up scan pulling only the delta messages sent during downtime. |
 | **`emoji_daily_usage`** | `date` (`'YYYY-MM-DD'`), `user_id`, `user_name`, `emoji`, `count` | Stores daily emoji counts per user. Feeds **`!myemojis`** and **`!emojileaderboard`**. Entries older than 30 days are automatically deleted by the hourly maintenance loop. |
 | **`prison_records`** | `user_id`, `roles` (JSON list of role IDs), `jailed_at` | Preserves all stripped non-category roles when a member is sent to Prison Island (`!prison`), allowing full role restoration on release. |
 | **`unc_records`** | `user_id`, `count` | Tracks voice channel misclick counts for the 5-tier Unc dynasty role progression. |
