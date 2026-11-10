@@ -42,13 +42,13 @@ UNC_MISCLICK_MESSAGES = (
 
 UNC_SOLO_MESSAGES = (
     "👴 {member} thought they could dodge the timer by waiting in `{channel}` for {d_time} seconds... completely alone. Still caught you.",
-    "👻 {member} just spent {d_time} seconds talking to ghosts in an empty VC. The meds are wearing off!",
-    "🧭 Someone get {member} a map. Bro wandered into an empty room, stood there for {d_time} seconds, and slowly walked out.",
+    "👻 {member} just spent {d_time} seconds talking to ghosts in an empty voice channel. The meds are wearing off!",
+    "🧭 Someone get {member} a map. Bro wandered into an empty voice channel, stood there for {d_time} seconds, and slowly walked out.",
     "🕵️ Nice try, {member}. Sitting in an empty channel for {d_time} seconds doesn't hide the misclick.",
     "🦉 *crickets*... That's what {member} heard for {d_time} seconds before realizing they were in the wrong channel.",
-    "🤡 {member} really sat in silence for {d_time} seconds hoping the bot wouldn't notice. Unc status secured.",
+    "🤡 {member} really sat in silence in the voice channel for {d_time} seconds hoping the bot wouldn't notice. Unc status secured.",
     "🧓 Has anyone checked on {member}? They just stared at the walls of an empty voice channel for {d_time} seconds.",
-    "🛑 {member} tried the 'stand perfectly still so the bot doesn't see me' trick for {d_time} seconds. It didn't work.",
+    "🛑 {member} tried the 'stand perfectly still in `{channel}` so the bot doesn't see me' trick for {d_time} seconds. It didn't work.",
     "🕸️ {member} got lost in the cobwebs of `{channel}` for {d_time} seconds all by themselves.",
     "📟 {member} spent {d_time} seconds alone in `{channel}` pretending that was the plan. The Unc council disagrees.",
 )
@@ -428,7 +428,7 @@ class Moderation(commands.Cog):
                                     msg = f"👑 **MAX LEVEL!** {member.mention} achieved 20 misclicks and has ascended to **{role_name}**!"
                                 else:
                                     templates = UNC_SOLO_MESSAGES if solo_case else UNC_MISCLICK_MESSAGES
-                                    msg = random.choice(templates).format(**fmt) + f" (Total misclicks: {current_count})"
+                                    msg = random.choice(templates).format(**fmt)
 
                                 await general_channel.send(msg)
                                 log_msg = msg.replace(member.mention, member.name)

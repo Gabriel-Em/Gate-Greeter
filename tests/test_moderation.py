@@ -845,16 +845,16 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.assertNotIn("missclicking into", msg)
         self.assertNotIn("Total misclicks", msg)
 
-    async def test_non_first_regular_catch_ends_with_total(self):
+    async def test_non_first_regular_catch_contains_channel(self):
         await self._set_count(1, 1)
         msg = await self._catch(self._member(1), 2, others=True)
-        self.assertTrue(msg.endswith("(Total misclicks: 2)"), msg)
+        self.assertNotIn("Total misclicks", msg)
         self.assertIn("`lobby`", msg)
 
-    async def test_non_first_solo_catch_ends_with_total_and_seconds(self):
+    async def test_non_first_solo_catch_contains_seconds(self):
         await self._set_count(1, 2)
         msg = await self._catch(self._member(1), 10)
-        self.assertTrue(msg.endswith("(Total misclicks: 3)"), msg)
+        self.assertNotIn("Total misclicks", msg)
         self.assertIn("10", msg)
 
     async def test_milestone_message_has_no_total_suffix(self):
