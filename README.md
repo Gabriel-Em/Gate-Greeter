@@ -5,6 +5,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 ## Features
 
 ### 🛡️ Moderation & Security System
+- **New Member Greeting**: Greets new members with a welcome message mentioning their username, bolding the server name, and linking directly to `#rules` (`<#RULES_CHANNEL_ID>`) for onboarding instructions.
 - **Manual Quarantine (`!quarantine @user`)**: Allows staff with `manage_roles` permissions to manually quarantine a user, securely snapshotting all their roles, stripping non-category roles, assigning the Quarantine role, and posting an alert in the quarantine channel with a one-click release button.
 - **Prison & Quarantine Release (`!release @user` / `!unquarantine @user` / "🌿 Release into the Wild" Button)**:
   - Releases quarantined users or prison inmates, automatically restoring all of their prior saved roles.

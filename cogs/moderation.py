@@ -115,6 +115,9 @@ class Moderation(commands.Cog):
 
         # Load Channel IDs from Environment
         self.general_channel_id = get_env_int("GENERAL_CHANNEL_ID")
+        self.welcome_channel_id = get_env_int("WELCOME_CHANNEL_ID")
+        self.newcomers_channel_id = get_env_int("NEWCOMERS_CHANNEL_ID", 796842000673800222)
+        self.rules_channel_id = get_env_int("RULES_CHANNEL_ID", 796842030332248105)
         self.quarantine_channel_id = get_env_int("QUARANTINE_CHANNEL_ID")
         self.quarantine_logs_channel_id = get_env_int("QUARANTINE_LOGS_CHANNEL_ID")
         self.mods_chat_id = get_env_int("MODS_CHAT_ID")
@@ -838,6 +841,30 @@ class Moderation(commands.Cog):
                     )
             except discord.Forbidden:
                 print(f"⚠️ Could not lock down {member.name}: Bot lacks permissions.")
+
+        # 4. Standard Member Greeting
+        else:
+            if not member.bot and is_env_enabled("ENABLE_GREETING", default=True):
+                target_channel = (
+                    member.guild.get_channel(self.newcomers_channel_id)
+                    if self.newcomers_channel_id
+                    else None
+                )
+                if not target_channel and self.welcome_channel_id:
+                    target_channel = member.guild.get_channel(self.welcome_channel_id)
+                if not target_channel and self.general_channel_id:
+                    target_channel = member.guild.get_channel(self.general_channel_id)
+                if not target_channel:
+                    target_channel = member.guild.system_channel
+
+                if target_channel:
+                    try:
+                        await target_channel.send(
+                            f"Hey {member.mention}, welcome to **{member.guild.name}**! "
+                            f"In order to get access to all of the channels please follow the instructions from <#{self.rules_channel_id}>."
+                        )
+                    except discord.Forbidden:
+                        print(f"⚠️ Could not send welcome greeting to #{target_channel.name}: Bot lacks permissions.")
 
     # ---------------------------------------------------------
     # AUTOMOD MONITORING (New Member Auto-Quarantine)

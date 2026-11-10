@@ -609,6 +609,67 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         # Run on_ready
         await self.cog.on_ready()
 
+    async def test_member_greeting_on_join(self):
+        """Standard new members joining are greeted in newcomers channel with guild name and clickable rules channel."""
+        newcomers_channel = MagicMock(spec=discord.TextChannel, id=444, name="newcomers")
+        newcomers_channel.send = AsyncMock()
+        self.cog.newcomers_channel_id = 444
+        self.cog.rules_channel_id = 796842030332248105
+
+        orig_get_channel = self.guild.get_channel.side_effect
+        self.guild.get_channel.side_effect = lambda cid: newcomers_channel if cid == 444 else orig_get_channel(cid)
+        self.guild.name = "CosmicSkeptic's community"
+
+        member = self._create_member(user_id=12345, created_days_ago=15, joined_days_ago=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        newcomers_channel.send.assert_awaited_once()
+        sent_content = newcomers_channel.send.call_args.args[0]
+        self.assertIn("Hey <@12345>", sent_content)
+        self.assertIn("welcome to **CosmicSkeptic's community**!", sent_content)
+        self.assertIn("please follow the instructions from <#796842030332248105>.", sent_content)
+
+    async def test_member_greeting_disabled_by_env(self):
+        """When ENABLE_GREETING is False, standard new members are not greeted on join."""
+        newcomers_channel = MagicMock(spec=discord.TextChannel, id=444, name="newcomers")
+        newcomers_channel.send = AsyncMock()
+        self.cog.newcomers_channel_id = 444
+
+        orig_get_channel = self.guild.get_channel.side_effect
+        self.guild.get_channel.side_effect = lambda cid: newcomers_channel if cid == 444 else orig_get_channel(cid)
+
+        member = self._create_member(user_id=12345, created_days_ago=15, joined_days_ago=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), patch("cogs.moderation.is_env_enabled", return_value=False):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        newcomers_channel.send.assert_not_called()
+
+    async def test_member_greeting_not_sent_for_quarantined_user(self):
+        """Auto-quarantined users receive quarantine notice, not the public newcomers greeting."""
+        newcomers_channel = MagicMock(spec=discord.TextChannel, id=444, name="newcomers")
+        newcomers_channel.send = AsyncMock()
+        self.cog.newcomers_channel_id = 444
+
+        orig_get_channel = self.guild.get_channel.side_effect
+        self.guild.get_channel.side_effect = lambda cid: newcomers_channel if cid == 444 else orig_get_channel(cid)
+
+        # Account age <= 7 days triggers auto-quarantine
+        member = self._create_member(user_id=12345, created_days_ago=3, joined_days_ago=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        # Quarantined, so newcomers channel greeting was not sent
+        newcomers_channel.send.assert_not_called()
+        # Quarantine channel notice was sent
+        self.quarantine_channel.send.assert_awaited_once()
+
 
 if __name__ == "__main__":
     unittest.main()
