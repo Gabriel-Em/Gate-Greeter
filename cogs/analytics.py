@@ -128,6 +128,26 @@ class Analytics(commands.Cog):
         ) - timedelta(seconds=1)
         return start_dt, end_dt
 
+    @staticmethod
+    def _get_past_months(
+        months_count: int, ref_dt: Optional[datetime] = None
+    ) -> list[tuple[int, int]]:
+        """Returns a list of (year, month) tuples for the past `months_count` months ending at `ref_dt` (inclusive)."""
+        if months_count <= 0:
+            return []
+        if ref_dt is None:
+            ref_dt = datetime.now(timezone.utc)
+        current_year = ref_dt.year
+        current_month = ref_dt.month
+        total_idx = current_year * 12 + (current_month - 1)
+        start_idx = total_idx - (months_count - 1)
+        result = []
+        for idx in range(start_idx, total_idx + 1):
+            y = idx // 12
+            m = (idx % 12) + 1
+            result.append((y, m))
+        return result
+
     async def flush_buffer(self) -> None:
         """Flushes in-memory accumulated metrics to SQLite in single transactions."""
         if self.is_syncing:
@@ -518,6 +538,132 @@ class Analytics(commands.Cog):
             f"📊 **Server Activity (Last {ACTIVITY_DAYS_WINDOW} Days):**",
             files=[file_hourly, file_daily],
         )
+
+    @commands.command(name="activity", aliases=["monthlyactivity", "activitymonthly"])
+    async def activity(self, ctx, months: int = 12):
+        """Shows server message activity as a graph per month for the past N months."""
+        if not self._is_enabled("ENABLE_CMD_ACTIVITY"):
+            return
+
+        if months <= 0:
+            return await ctx.send(
+                "⚠️ Please provide a positive number of months (e.g. `!activity 24`)."
+            )
+
+        if months > 120:
+            return await ctx.send("⚠️ Maximum allowed range is 120 months (10 years).")
+
+        now_utc = datetime.now(timezone.utc)
+        month_list = self._get_past_months(months, now_utc)
+
+        await self.flush_buffer()
+
+        # Identify missing past months that need historical scraping (Option A)
+        missing_past_months = []
+        for y, m in month_list:
+            start_dt, end_dt = self._get_month_bounds(y, m)
+            # Compare tz-aware
+            if end_dt.tzinfo is None:
+                end_dt = end_dt.replace(tzinfo=timezone.utc)
+            if end_dt < now_utc:
+                is_complete = await self.db.is_month_complete(y, m)
+                if not is_complete:
+                    missing_past_months.append((y, m))
+
+        status_msg = None
+        if missing_past_months:
+            total_missing = len(missing_past_months)
+            status_msg = await ctx.send(
+                f"⏳ Missing historical data detected for {total_missing} month(s). Starting automatic scrape..."
+            )
+            for idx, (y, m) in enumerate(missing_past_months, 1):
+                prefix = f"⏳ Scraping message history for **{y}-{m:02d}** ({idx}/{total_missing})"
+                try:
+                    await status_msg.edit(content=f"{prefix}...")
+                except Exception:
+                    pass
+                await self._scrape_month_data(ctx.guild, y, m, status_msg, prefix)
+
+        # Query aggregated monthly totals from SQLite
+        monthly_data = await self.db.get_monthly_totals(month_list)
+        total_messages = sum(monthly_data.values())
+
+        if total_messages == 0:
+            if status_msg:
+                try:
+                    await status_msg.delete()
+                except Exception:
+                    pass
+            return await ctx.send(f"ℹ️ No message activity recorded for the past {months} months.")
+
+        if status_msg:
+            try:
+                await status_msg.edit(content="📊 Generating activity chart...")
+            except Exception:
+                pass
+
+        # Generate Matplotlib chart
+        x_labels = [f"{y}-{m:02d}" for y, m in month_list]
+        counts = [monthly_data.get((y, m), 0) for y, m in month_list]
+
+        fig_width = max(10, min(24, len(month_list) * 0.6))
+        plt.figure(figsize=(fig_width, 5.5))
+        bars = plt.bar(x_labels, counts, color=COLOR_HOURLY_BAR, edgecolor="#1e40af", alpha=0.85)
+
+        # Annotate bars if reasonably spaced
+        if len(month_list) <= 36:
+            max_c = max(counts) if counts else 1
+            for bar in bars:
+                height = bar.get_height()
+                if height > 0:
+                    plt.text(
+                        bar.get_x() + bar.get_width() / 2,
+                        height + (max_c * 0.015),
+                        f"{int(height):,}",
+                        ha="center",
+                        va="bottom",
+                        fontsize=8 if len(month_list) > 18 else 9,
+                        rotation=90 if len(month_list) > 18 else 0,
+                    )
+
+        plt.title(f"Server Activity (Past {months} Months) [Messages per Month]", fontsize=14, fontweight="bold")
+        plt.xlabel("Month", fontsize=11)
+        plt.ylabel("Total Messages", fontsize=11)
+        plt.xticks(rotation=45, ha="right", fontsize=9)
+        plt.grid(axis="y", linestyle="--", alpha=0.6)
+        plt.tight_layout()
+
+        buf = io.BytesIO()
+        plt.savefig(buf, format="png", dpi=100)
+        buf.seek(0)
+        plt.close()
+
+        file = discord.File(fp=buf, filename="monthly_activity.png")
+
+        # Summary statistics
+        avg_messages = total_messages / len(month_list)
+        max_month_pair = max(monthly_data.items(), key=lambda item: item[1])
+        max_month_label = f"{max_month_pair[0][0]}-{max_month_pair[0][1]:02d}"
+        max_month_count = max_month_pair[1]
+
+        embed = discord.Embed(
+            title=f"📈 Server Activity (Past {months} Months)",
+            description=(
+                f"• **Total Messages:** {total_messages:,}\n"
+                f"• **Monthly Average:** {avg_messages:,.1f}\n"
+                f"• **Peak Month:** {max_month_label} ({max_month_count:,} messages)"
+            ),
+            color=discord.Color.blue(),
+        )
+        embed.set_image(url="attachment://monthly_activity.png")
+
+        if status_msg:
+            try:
+                await status_msg.delete()
+            except Exception:
+                pass
+
+        await ctx.send(embed=embed, files=[file])
 
     @commands.command(name="topusers")
     async def topusers(self, ctx, year: int = None, month: int = None):

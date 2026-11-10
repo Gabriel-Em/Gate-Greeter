@@ -29,6 +29,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 
 ### 📈 Analytics
 *Channels ending in `logs` or `log` are excluded from tracking.*
+- **`!activity [months]`**: Generates a monthly message activity graph for the past number of months (default 12, up to 120). Automatically backfills and scrapes unarchived historical months on demand.
 - **`!topusers [year] <month>`**: Displays the top 10 most active members for a given year or specific month.
 - **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message activity graphs.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
@@ -81,6 +82,7 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    ENABLE_BACKUP=True
 
    # Granular Analytics Commands
+   ENABLE_CMD_ACTIVITY=True
    ENABLE_CMD_ACTIVITY30=True
    ENABLE_CMD_TOPUSERS=True
    ENABLE_CMD_PRONOUNSTATS=True

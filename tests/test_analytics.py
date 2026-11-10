@@ -350,5 +350,164 @@ class TestEmojiCommands(unittest.IsolatedAsyncioTestCase):
         self.assertIn("🍕", embed.description)
 
 
+class TestMonthlyActivityCommand(unittest.IsolatedAsyncioTestCase):
+    """Unit tests for the get_past_months calculation and !activity monthly command."""
+
+    async def asyncSetUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.test_db_file = os.path.join(self.test_dir, "test_monthly.db")
+        self.test_db = Database(self.test_db_file)
+        await self.test_db.initialize()
+
+        self.bot = MagicMock(spec=commands.Bot)
+        self.cog = Analytics(self.bot, db=self.test_db)
+
+        self.guild = MagicMock(spec=discord.Guild)
+        self.guild.me = MagicMock()
+        self.channel = MagicMock(spec=discord.TextChannel)
+        self.channel.name = "general"
+        self.channel.permissions_for.return_value.read_message_history = True
+        self.guild.text_channels = [self.channel]
+
+        self.ctx = MagicMock()
+        self.ctx.guild = self.guild
+        self.ctx.send = AsyncMock()
+
+    async def asyncTearDown(self):
+        await self.test_db.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def test_get_past_months_calculation(self):
+        """Verifies rolling month window calculation across years and boundaries."""
+        ref_dt = datetime(2026, 11, 10, tzinfo=timezone.utc)
+
+        # 1 month: current month only
+        m1 = self.cog._get_past_months(1, ref_dt)
+        self.assertEqual(m1, [(2026, 11)])
+
+        # 2 months
+        m2 = self.cog._get_past_months(2, ref_dt)
+        self.assertEqual(m2, [(2026, 10), (2026, 11)])
+
+        # 12 months: exactly 1 year (Dec 2025 to Nov 2026)
+        m12 = self.cog._get_past_months(12, ref_dt)
+        self.assertEqual(len(m12), 12)
+        self.assertEqual(m12[0], (2025, 12))
+        self.assertEqual(m12[-1], (2026, 11))
+
+        # 24 months: exactly 2 years (Dec 2024 to Nov 2026)
+        m24 = self.cog._get_past_months(24, ref_dt)
+        self.assertEqual(len(m24), 24)
+        self.assertEqual(m24[0], (2024, 12))
+        self.assertEqual(m24[-1], (2026, 11))
+
+        # Boundary condition: year rollover across January
+        jan_ref = datetime(2026, 1, 15, tzinfo=timezone.utc)
+        m3_jan = self.cog._get_past_months(3, jan_ref)
+        self.assertEqual(m3_jan, [(2025, 11), (2025, 12), (2026, 1)])
+
+        # Degenerate inputs: 0 or negative
+        self.assertEqual(self.cog._get_past_months(0, ref_dt), [])
+        self.assertEqual(self.cog._get_past_months(-5, ref_dt), [])
+
+    async def test_activity_invalid_or_extreme_arguments(self):
+        """Rejects zero, negative, or excessively large month arguments."""
+        await self.cog.activity.callback(self.cog, self.ctx, months=0)
+        self.ctx.send.assert_called_once()
+        self.assertIn("positive number of months", self.ctx.send.call_args[0][0])
+
+        self.ctx.send.reset_mock()
+        await self.cog.activity.callback(self.cog, self.ctx, months=-6)
+        self.ctx.send.assert_called_once()
+        self.assertIn("positive number of months", self.ctx.send.call_args[0][0])
+
+        self.ctx.send.reset_mock()
+        await self.cog.activity.callback(self.cog, self.ctx, months=121)
+        self.ctx.send.assert_called_once()
+        self.assertIn("Maximum allowed range", self.ctx.send.call_args[0][0])
+
+    async def test_activity_disabled_by_env(self):
+        """Immediately returns if ENABLE_CMD_ACTIVITY is set to False."""
+        with patch.object(self.cog, "_is_enabled", return_value=False):
+            await self.cog.activity.callback(self.cog, self.ctx, months=12)
+            self.ctx.send.assert_not_called()
+
+    async def test_activity_no_data(self):
+        """Notifies user if no messages are recorded in the requested window."""
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+        self.ctx.send.return_value = status_msg
+
+        # Patch scraping to do nothing and past months are marked complete
+        fixed_now = datetime(2026, 11, 10, tzinfo=timezone.utc)
+        with patch("cogs.analytics.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+            # Mark the past month complete so it does not scrape
+            await self.test_db.set_month_complete(2026, 10, True)
+
+            await self.cog.activity.callback(self.cog, self.ctx, months=2)
+
+        # Confirm message indicates no message activity
+        last_send = self.ctx.send.call_args_list[-1][0][0]
+        self.assertIn("No message activity recorded", last_send)
+
+    async def test_activity_scrapes_missing_past_months_and_generates_graph(self):
+        """Option A: Automatically scrapes incomplete past months, then generates and sends graph."""
+        status_msg = AsyncMock()
+        status_msg.delete = AsyncMock()
+        status_msg.edit = AsyncMock()
+        self.ctx.send.return_value = status_msg
+
+        # 3 months: Sep 2026, Oct 2026, Nov 2026
+        # Pre-seed: Sep 2026 is marked complete in DB
+        await self.test_db.set_month_complete(2026, 9, True)
+        await self.test_db.record_messages_batch(
+            {(2026, 9, 101, "Alice"): 100}, {}, {}
+        )
+        # Nov 2026 is current month (already has 50 messages)
+        await self.test_db.record_messages_batch(
+            {(2026, 11, 101, "Alice"): 50}, {}, {}
+        )
+        # Oct 2026 is incomplete in the past. It should be scraped by Option A.
+        scrape_calls = []
+
+        async def mock_scrape(guild, year, month, s_msg=None, progress_prefix=""):
+            scrape_calls.append((year, month))
+            await self.test_db.record_messages_batch(
+                {(year, month, 102, "Bob"): 75}, {}, {}
+            )
+            await self.test_db.set_month_complete(year, month, True)
+
+        self.cog._scrape_month_data = AsyncMock(side_effect=mock_scrape)
+
+        fixed_now = datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+        with patch("cogs.analytics.datetime") as mock_dt:
+            mock_dt.now.return_value = fixed_now
+            mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+            await self.cog.activity.callback(self.cog, self.ctx, months=3)
+
+        # Oct 2026 (incomplete past month) MUST have been scraped
+        self.assertEqual(scrape_calls, [(2026, 10)])
+
+        # Status message was deleted or edited
+        status_msg.delete.assert_called_once()
+
+        # Final response should have an embed and a PNG file attachment
+        send_calls = self.ctx.send.call_args_list
+        final_call_kwargs = send_calls[-1][1]
+        self.assertIn("embed", final_call_kwargs)
+        self.assertIn("files", final_call_kwargs)
+
+        embed = final_call_kwargs["embed"]
+        self.assertIn("Server Activity (Past 3 Months)", embed.title)
+        self.assertIn("225", embed.description)  # Total: 100 + 75 + 50 = 225 messages
+
+        files = final_call_kwargs["files"]
+        self.assertEqual(len(files), 1)
+        self.assertEqual(files[0].filename, "monthly_activity.png")
+
+
 if __name__ == "__main__":
     unittest.main()

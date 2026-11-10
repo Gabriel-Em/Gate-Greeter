@@ -191,6 +191,33 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         top10 = await self.db.get_top_users(2026, 10)
         self.assertEqual(len(top10), 1)
 
+    async def test_get_monthly_totals(self):
+        # Insert multi-user message activity across distinct months and years
+        user_batch = {
+            (2025, 11, 101, "Alice"): 10,
+            (2025, 11, 102, "Bob"): 5,
+            (2025, 12, 101, "Alice"): 20,
+            (2026, 1, 101, "Alice"): 30,
+            (2026, 1, 102, "Bob"): 15,
+            (2026, 2, 101, "Alice"): 40,
+            (2026, 2, 102, "Bob"): 25,
+        }
+        await self.db.record_messages_batch(user_batch, {}, {})
+
+        # Query range including a month with no recorded activity (2025, 10)
+        target_months = [(2025, 10), (2025, 11), (2025, 12), (2026, 1), (2026, 2)]
+        totals = await self.db.get_monthly_totals(target_months)
+
+        self.assertEqual(totals[(2025, 10)], 0)
+        self.assertEqual(totals[(2025, 11)], 15)
+        self.assertEqual(totals[(2025, 12)], 20)
+        self.assertEqual(totals[(2026, 1)], 45)
+        self.assertEqual(totals[(2026, 2)], 65)
+
+        # Boundary test: empty month list
+        empty_totals = await self.db.get_monthly_totals([])
+        self.assertEqual(empty_totals, {})
+
 
 if __name__ == "__main__":
     unittest.main()

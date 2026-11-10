@@ -453,6 +453,36 @@ class Database:
         )
         return [(row["date_hour"], row["message_count"]) for row in cur.fetchall()]
 
+    async def get_monthly_totals(
+        self, months: List[Tuple[int, int]]
+    ) -> Dict[Tuple[int, int], int]:
+        """Returns a mapping of (year, month) -> total message count across all users."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_monthly_totals, months)
+
+    def _sync_get_monthly_totals(
+        self, months: List[Tuple[int, int]]
+    ) -> Dict[Tuple[int, int], int]:
+        conn = self._get_connection()
+        result: Dict[Tuple[int, int], int] = {m: 0 for m in months}
+        if not months:
+            return result
+
+        placeholders = " OR ".join(["(year = ? AND month = ?)"] * len(months))
+        params: List[int] = [item for m in months for item in m]
+        cur = conn.execute(
+            f"""
+            SELECT year, month, SUM(message_count) as total
+            FROM user_monthly_activity
+            WHERE {placeholders}
+            GROUP BY year, month;
+            """,
+            params,
+        )
+        for row in cur.fetchall():
+            result[(row["year"], row["month"])] = row["total"] or 0
+        return result
+
     async def is_month_complete(self, year: int, month: int) -> bool:
         async with self._lock:
             return await asyncio.to_thread(self._sync_is_month_complete, year, month)
