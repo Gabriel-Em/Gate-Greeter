@@ -16,7 +16,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Evasion Prevention & Strict Role Enforcement**:
   - If an imprisoned or quarantined user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, drags them back into prison or quarantine, and logs the evasion attempt.
   - Monitors member role updates in real time (`on_member_update`) and immediately strips any unauthorized self-assigned or onboarding roles acquired while a user is in Quarantine or Prison.
-- **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s) and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently in the database, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
+- **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s), or sitting completely alone in an empty channel for up to `UNC_SOLO_MAX_SECONDS` (default 15s), and assigns them the "Unc" role. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently in the database, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
 - **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions. Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
 - **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
 
@@ -106,6 +106,7 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    TRUST_THRESHOLD=30
    TRUST_COOLDOWN_SECONDS=60
    UNC_MISCLICK_MAX_SECONDS=3.0
+   UNC_SOLO_MAX_SECONDS=25.0
    UNC_COOLDOWN_SECONDS=3600
    ANTI_NUKE_CHANNEL_LIMIT=2
    ANTI_NUKE_WINDOW_SECONDS=600

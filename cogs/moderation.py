@@ -1,5 +1,6 @@
 import os
 import asyncio
+import random
 import re
 from datetime import datetime
 import discord
@@ -26,6 +27,32 @@ QUARANTINE_FILE = "quarantine_data.json"
 # ---------------------------------------------------------
 # PERSISTENT INTERACTIVE COMPONENTS
 # ---------------------------------------------------------
+UNC_MISCLICK_MESSAGES = (
+    "👴 {member} walked into `{channel}`, instantly forgot why they were there, and immediately backed out.",
+    "👓 {member} is struggling with the mouse again! Another boomer misclick into `{channel}`.",
+    "🦴 We heard {member}'s knees pop as they stumbled into `{channel}` by mistake.",
+    "👴 {member} squinted at the screen, clicked the wrong channel, and panic-left `{channel}`.",
+    "🏠 'Whoops, wrong house!' {member} just stumbled into `{channel}` and tripped on the way out.",
+    "📺 {member} thought the Discord channel list was a TV guide. Another misclick into `{channel}`!",
+    "🖱️ {member} was typing with their index fingers and accidentally double-clicked their way into `{channel}`.",
+    "👴 Someone come collect {member}, they just wandered into `{channel}` looking for the bingo hall."
+    "📠 {member} tried to send a fax but somehow clicked into `{channel}` instead.",
+    "👓 {member} couldn't find their reading glasses and accidentally wandered into `{channel}`.",
+)
+
+UNC_SOLO_MESSAGES = (
+    "👴 {member} thought they could dodge the timer by waiting in `{channel}` for {d_time} seconds... completely alone. Still caught you.",
+    "👻 {member} just spent {d_time} seconds talking to ghosts in an empty VC. The meds are wearing off!",
+    "🧭 Someone get {member} a map. Bro wandered into an empty room, stood there for {d_time} seconds, and slowly walked out.",
+    "🕵️ Nice try, {member}. Sitting in an empty channel for {d_time} seconds doesn't hide the misclick.",
+    "🦉 *crickets*... That's what {member} heard for {d_time} seconds before realizing they were in the wrong channel.",
+    "🤡 {member} really sat in silence for {d_time} seconds hoping the bot wouldn't notice. Unc status secured.",
+    "🧓 Has anyone checked on {member}? They just stared at the walls of an empty voice channel for {d_time} seconds.",
+    "🛑 {member} tried the 'stand perfectly still so the bot doesn't see me' trick for {d_time} seconds. It didn't work.",
+    "🕸️ {member} got lost in the cobwebs of `{channel}` for {d_time} seconds all by themselves.",
+    "📟 {member} spent {d_time} seconds alone in `{channel}` pretending that was the plan. The Unc council disagrees.",
+)
+
 class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"quarantine:release:(?P<user_id>[0-9]+)"):
     def __init__(self, user_id: int = 0):
         super().__init__(
@@ -137,6 +164,7 @@ class Moderation(commands.Cog):
         self.trust_threshold = get_env_int("TRUST_THRESHOLD", 30)
         self.trust_cooldown_seconds = get_env_int("TRUST_COOLDOWN_SECONDS", 60)
         self.unc_misclick_max_seconds = get_env_float("UNC_MISCLICK_MAX_SECONDS", 3.0)
+        self.unc_solo_max_seconds = get_env_float("UNC_SOLO_MAX_SECONDS", 25.0)
         self.unc_cooldown_seconds = get_env_int("UNC_COOLDOWN_SECONDS", 3600)
         self.anti_nuke_limit = get_env_int("ANTI_NUKE_CHANNEL_LIMIT", 2)
         self.anti_nuke_window = get_env_int("ANTI_NUKE_WINDOW_SECONDS", 600)
@@ -331,7 +359,8 @@ class Moderation(commands.Cog):
             if record and record["channel_id"] == before.channel.id:
                 duration = (now - record["time"]).total_seconds()
 
-                if duration < self.unc_misclick_max_seconds:
+                was_solo = record.get("alone", False) and duration < self.unc_solo_max_seconds
+                if duration < self.unc_misclick_max_seconds or was_solo:
                     last_misclick = self.unc_cooldowns.get(member.id)
                     if last_misclick and (now - last_misclick).total_seconds() < self.unc_cooldown_seconds:
                         self.voice_join_times.pop(member.id, None)
@@ -378,7 +407,16 @@ class Moderation(commands.Cog):
                             general_channel = member.guild.get_channel(self.general_channel_id)
                             if general_channel:
                                 role_name = target_role.name
-                                if current_count == 1:
+                                solo_case = was_solo and duration >= self.unc_misclick_max_seconds
+                                fmt = {
+                                    "member": member.mention,
+                                    "channel": before.channel.name,
+                                    "d_time": int(duration),
+                                    "role": role_name,
+                                }
+                                if current_count == 1 and solo_case:
+                                    msg = f"🪑 {member.mention} sat alone in `{before.channel.name}` for {int(duration)} seconds hoping nobody would notice, and just earned the **{role_name}** role anyway!"
+                                elif current_count == 1:
                                     msg = f"👴 {member.mention} just earned the **{role_name}** role for missclicking into the `{before.channel.name}` voice channel!"
                                 elif current_count == 5:
                                     msg = f"🌟 **LEVEL UP!** {member.mention} misclicked for the 5th time and evolved into a **{role_name}**!"
@@ -389,7 +427,8 @@ class Moderation(commands.Cog):
                                 elif current_count == 20:
                                     msg = f"👑 **MAX LEVEL!** {member.mention} achieved 20 misclicks and has ascended to **{role_name}**!"
                                 else:
-                                    msg = f"👴 {member.mention} just misclicked into `{before.channel.name}`! (Total misclicks: {current_count})"
+                                    templates = UNC_SOLO_MESSAGES if solo_case else UNC_MISCLICK_MESSAGES
+                                    msg = random.choice(templates).format(**fmt) + f" (Total misclicks: {current_count})"
 
                                 await general_channel.send(msg)
                                 log_msg = msg.replace(member.mention, member.name)
@@ -402,9 +441,14 @@ class Moderation(commands.Cog):
 
         # Event: Joined a channel
         if after.channel is not None:
+            # Anyone already waiting in this channel is no longer alone.
+            for other in self.voice_join_times.values():
+                if other["channel_id"] == after.channel.id:
+                    other["alone"] = False
             self.voice_join_times[member.id] = {
                 "time": now,
                 "channel_id": after.channel.id,
+                "alone": all(m.id == member.id for m in after.channel.members),
             }
 
     # ---------------------------------------------------------

@@ -687,3 +687,188 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
+    ROLE_IDS = [11, 12, 13, 14, 15]
+
+    async def asyncSetUp(self):
+        self.test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "tmp"))
+        os.makedirs(self.test_dir, exist_ok=True)
+        self.db_file = os.path.join(self.test_dir, "test_unc_voice.db")
+        if os.path.exists(self.db_file):
+            os.remove(self.db_file)
+        self.db = Database(self.db_file)
+
+        bot = MagicMock(spec=commands.Bot)
+        bot.add_dynamic_items = MagicMock()
+        bot.remove_dynamic_items = MagicMock()
+        bot.get_guild.return_value = None
+        self.cog = Moderation(bot, db=self.db)
+        self.cog.unc_role_ids = self.ROLE_IDS
+        self.cog.unc_misclick_max_seconds = 3.0
+        self.cog.unc_solo_max_seconds = 15.0
+        self.cog.unc_cooldown_seconds = 3600
+        self.cog.general_channel_id = 500
+
+        self.role = MagicMock()
+        self.role.id = self.ROLE_IDS[0]
+        self.role.name = "Unc"
+        self.general = MagicMock()
+        self.general.send = AsyncMock()
+        self.guild = MagicMock()
+        self.guild.get_role.return_value = self.role
+        self.guild.get_channel.return_value = self.general
+
+        self.channel = self._channel(1, "lobby")
+
+    def _channel(self, cid, name):
+        ch = MagicMock()
+        ch.id = cid
+        ch.name = name
+        ch.members = []
+        return ch
+
+    def _member(self, uid):
+        m = MagicMock()
+        m.id = uid
+        m.bot = False
+        m.guild = self.guild
+        m.roles = []
+        m.mention = f"<@{uid}>"
+        m.name = f"user{uid}"
+        m.add_roles = AsyncMock()
+        m.remove_roles = AsyncMock()
+        return m
+
+    def _state(self, channel):
+        s = MagicMock()
+        s.channel = channel
+        return s
+
+    async def _join(self, member, channel, at):
+        channel.members.append(member)
+        with patch("cogs.moderation.datetime") as dt:
+            dt.now.return_value = at
+            await self.cog.on_voice_state_update(member, self._state(None), self._state(channel))
+
+    async def _leave(self, member, channel, at):
+        channel.members.remove(member)
+        with patch("cogs.moderation.datetime") as dt:
+            dt.now.return_value = at
+            await self.cog.on_voice_state_update(member, self._state(channel), self._state(None))
+
+    async def test_alone_for_10_seconds_is_awarded(self):
+        m = self._member(1)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=10))
+        self.assertEqual(await self.db.increment_unc_count(1), 2)
+        self.general.send.assert_awaited_once()
+        msg = self.general.send.call_args.args[0]
+        self.assertIn(m.mention, msg)
+        self.assertIn("10 seconds", msg)
+        self.assertIn("**Unc**", msg)
+        self.assertNotIn("Total misclicks", msg)
+
+    async def test_alone_beyond_limit_is_not_awarded(self):
+        m = self._member(1)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=15.5))
+        self.general.send.assert_not_awaited()
+        self.assertEqual(await self.db.increment_unc_count(1), 1)
+
+    async def test_not_alone_for_10_seconds_is_not_awarded(self):
+        m = self._member(1)
+        other = self._member(2)
+        self.channel.members.append(other)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=10))
+        self.general.send.assert_not_awaited()
+
+    async def test_someone_joining_then_leaving_voids_solo_status(self):
+        m = self._member(1)
+        other = self._member(2)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._join(other, self.channel, t0 + timedelta(seconds=2))
+        await self._leave(other, self.channel, t0 + timedelta(seconds=4))
+        await self._leave(m, self.channel, t0 + timedelta(seconds=10))
+        for call in self.general.send.call_args_list:
+            self.assertNotIn(m.mention, call.args[0])
+
+    async def test_classic_misclick_under_3s_with_others_present(self):
+        m = self._member(1)
+        self.channel.members.append(self._member(2))
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=2))
+        self.general.send.assert_awaited_once()
+
+    async def test_solo_limit_boundary_exactly_at_limit_not_awarded(self):
+        m = self._member(1)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=15))
+        self.general.send.assert_not_awaited()
+
+    async def test_solo_award_respects_cooldown(self):
+        m = self._member(1)
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=10))
+        await self._join(m, self.channel, t0 + timedelta(seconds=20))
+        await self._leave(m, self.channel, t0 + timedelta(seconds=30))
+        self.assertEqual(self.general.send.await_count, 1)
+
+    async def _set_count(self, uid, n):
+        for _ in range(n):
+            await self.db.increment_unc_count(uid)
+
+    async def _catch(self, m, seconds, others=False):
+        if others:
+            self.channel.members.append(self._member(99))
+        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        await self._join(m, self.channel, t0)
+        await self._leave(m, self.channel, t0 + timedelta(seconds=seconds))
+        return self.general.send.call_args.args[0]
+
+    async def test_first_regular_catch_uses_first_message_without_total(self):
+        msg = await self._catch(self._member(1), 2, others=True)
+        self.assertIn("just earned the **Unc** role for missclicking into the `lobby`", msg)
+        self.assertNotIn("Total misclicks", msg)
+
+    async def test_first_solo_catch_differs_from_first_regular_message(self):
+        msg = await self._catch(self._member(1), 10)
+        self.assertNotIn("missclicking into", msg)
+        self.assertNotIn("Total misclicks", msg)
+
+    async def test_non_first_regular_catch_ends_with_total(self):
+        await self._set_count(1, 1)
+        msg = await self._catch(self._member(1), 2, others=True)
+        self.assertTrue(msg.endswith("(Total misclicks: 2)"), msg)
+        self.assertIn("`lobby`", msg)
+
+    async def test_non_first_solo_catch_ends_with_total_and_seconds(self):
+        await self._set_count(1, 2)
+        msg = await self._catch(self._member(1), 10)
+        self.assertTrue(msg.endswith("(Total misclicks: 3)"), msg)
+        self.assertIn("10", msg)
+
+    async def test_milestone_message_has_no_total_suffix(self):
+        await self._set_count(1, 4)
+        msg = await self._catch(self._member(1), 10)
+        self.assertIn("LEVEL UP", msg)
+        self.assertNotIn("Total misclicks", msg)
+
+    async def test_regular_messages_vary_across_catches(self):
+        await self._set_count(1, 20)
+        seen = set()
+        for i in range(60):
+            self.cog.unc_cooldowns.clear()
+            self.channel.members.clear()
+            m = self._member(1)
+            seen.add((await self._catch(m, 2, others=True)).split("(Total")[0].replace("<@1>", ""))
+        self.assertGreaterEqual(len(seen), 5)
