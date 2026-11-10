@@ -670,6 +670,20 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         # Quarantine channel notice was sent
         self.quarantine_channel.send.assert_awaited_once()
 
+    async def test_member_greeting_skipped_when_newcomers_channel_not_found(self):
+        """When newcomers channel is not found in the guild, a warning is logged and greeting is aborted."""
+        self.cog.newcomers_channel_id = 999999
+        self.cog.rules_channel_id = 796842030332248105
+        self.guild.name = "CosmicSkeptic's community"
+
+        member = self._create_member(user_id=12345, created_days_ago=15, joined_days_ago=0)
+
+        with patch("asyncio.sleep", new_callable=AsyncMock), patch("builtins.print") as mock_print:
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        mock_print.assert_any_call("⚠️ Newcomers channel 999999 not found in guild CosmicSkeptic's community. Welcome greeting not sent.")
+
 
 if __name__ == "__main__":
     unittest.main()

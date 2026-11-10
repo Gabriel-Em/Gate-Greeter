@@ -115,7 +115,6 @@ class Moderation(commands.Cog):
 
         # Load Channel IDs from Environment
         self.general_channel_id = get_env_int("GENERAL_CHANNEL_ID")
-        self.welcome_channel_id = get_env_int("WELCOME_CHANNEL_ID")
         self.newcomers_channel_id = get_env_int("NEWCOMERS_CHANNEL_ID", 796842000673800222)
         self.rules_channel_id = get_env_int("RULES_CHANNEL_ID", 796842030332248105)
         self.quarantine_channel_id = get_env_int("QUARANTINE_CHANNEL_ID")
@@ -185,6 +184,7 @@ class Moderation(commands.Cog):
                 ("Logs", self.quarantine_logs_channel_id),
                 ("General", self.general_channel_id),
                 ("Mods", self.mods_chat_id),
+                ("Newcomers", self.newcomers_channel_id),
             ]
             chan_missing = []
             chan_perm_issues = []
@@ -850,21 +850,17 @@ class Moderation(commands.Cog):
                     if self.newcomers_channel_id
                     else None
                 )
-                if not target_channel and self.welcome_channel_id:
-                    target_channel = member.guild.get_channel(self.welcome_channel_id)
-                if not target_channel and self.general_channel_id:
-                    target_channel = member.guild.get_channel(self.general_channel_id)
                 if not target_channel:
-                    target_channel = member.guild.system_channel
+                    print(f"⚠️ Newcomers channel {self.newcomers_channel_id} not found in guild {member.guild.name}. Welcome greeting not sent.")
+                    return
 
-                if target_channel:
-                    try:
-                        await target_channel.send(
-                            f"Hey {member.mention}, welcome to **{member.guild.name}**! "
-                            f"In order to get access to all of the channels please follow the instructions from <#{self.rules_channel_id}>."
-                        )
-                    except discord.Forbidden:
-                        print(f"⚠️ Could not send welcome greeting to #{target_channel.name}: Bot lacks permissions.")
+                try:
+                    await target_channel.send(
+                        f"Hey {member.mention}, welcome to **{member.guild.name}**! "
+                        f"In order to get access to all of the channels please follow the instructions from <#{self.rules_channel_id}>."
+                    )
+                except discord.Forbidden:
+                    print(f"⚠️ Could not send welcome greeting to #{target_channel.name}: Bot lacks permissions.")
 
     # ---------------------------------------------------------
     # AUTOMOD MONITORING (New Member Auto-Quarantine)
