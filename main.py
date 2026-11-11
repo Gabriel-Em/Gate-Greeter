@@ -172,8 +172,13 @@ async def help_command(ctx):
             "active": True,
         },
         {
-            "name": "!emojify_channels",
-            "desc": "Edits server channel titles with their designated emoji prefixes (Admin only).",
+            "name": "!emojify_channels <revert>",
+            "desc": "Edits channel titles with emoji prefixes, or pass 'revert' to restore original names (Admin only).",
+            "active": True,
+        },
+        {
+            "name": "!revert_channels",
+            "desc": "Restores server channel titles back to their original names without emojis (Admin only).",
             "active": True,
         },
     ]
@@ -206,73 +211,102 @@ async def restart(ctx):
 # ---------------------------------------------------------
 CHANNEL_EMOJI_MAP = {
     # Top Section & Info
-    "newcomers": "👋 newcomers",
-    "welcome": "🤝 welcome",
-    "rules": "📜 rules",
-    "announcements": "📢 announcements",
-    "custom-roles": "🎭 custom-roles",
-    "partnerships": "🔗 partnerships",
-    "glossary": "📖 glossary",
-    "random-questions": "❓ random-questions",
+    "newcomers": "👋newcomers",
+    "welcome": "🤝welcome",
+    "rules": "📜rules",
+    "announcements": "📢announcements",
+    "custom-roles": "🎭custom-roles",
+    "partnerships": "🔗partnerships",
+    "glossary": "📖glossary",
+    "random-questions": "❓random-questions",
 
     # Community & Discussion
-    "veterans-lounge": "☕ veterans-lounge",
+    "veterans-lounge": "☕veterans-lounge",
     "Veterans' discussion": "🎖️ Veterans' discussion",
-    "general": "💬 general",
-    "serious-discussion": "🧐 serious-discussion",
+    "general": "💬general",
+    "serious-discussion": "🧐serious-discussion",
     "Lounge 1": "🛋️ Lounge 1",
     "Lounge 2": "🛋️ Lounge 2",
-    "history-culture": "🏛️ history-culture",
-    "philosophy": "🦉 philosophy",
-    "religion": "🕊️ religion",
-    "politics": "⚖️ politics",
-    "veganism": "🌱 veganism",
-    "science": "🔬 science",
-    "technology": "💻 technology",
+    "history-culture": "🏛️history-culture",
+    "philosophy": "🦉philosophy",
+    "religion": "🕊️religion",
+    "politics": "⚖️politics",
+    "veganism": "🌱veganism",
+    "science": "🔬science",
+    "technology": "💻technology",
     "Discussion 1": "🎙️ Discussion 1",
     "Discussion 2": "🎙️ Discussion 2",
 
     # Varied Ventures & Media
-    "hobbies": "🎨 hobbies",
-    "food": "🥗 food",
-    "finance-and-investing": "📈 finance-and-investing",
-    "health-and-lifestyle": "🧘 health-and-lifestyle",
-    "animals-nature": "🐾 animals-nature",
-    "career-advice": "💼 career-advice",
-    "venting": "😤 venting",
-    "memes": "😂 memes",
-    "music-art": "🎵 music-art",
-    "screens-stories": "📸 screens-stories",
-    "gaming": "🎮 gaming",
-    "best-of-server-moments": "⭐ best-of-server-moments",
+    "hobbies": "🎨hobbies",
+    "food": "🥗food",
+    "finance-and-investing": "📈finance-and-investing",
+    "health-and-lifestyle": "🧘health-and-lifestyle",
+    "animals-nature": "🐾animals-nature",
+    "career-advice": "💼career-advice",
+    "venting": "😤venting",
+    "memes": "😂memes",
+    "music-art": "🎵music-art",
+    "screens-stories": "📸screens-stories",
+    "gaming": "🎮gaming",
+    "best-of-server-moments": "⭐best-of-server-moments",
     "Gaming": "🎧 Gaming",
 
     # Moderation, Bots & Staff
-    "prison": "🔒 prison",
-    "quarantine": "☣️ quarantine",
-    "bot-commands": "🤖 bot-commands",
-    "cosmic-videos": "🌌 cosmic-videos",
-    "cosmic-twitter": "🐦 cosmic-twitter",
-    "to-do": "📋 to-do",
-    "mini-mod-chat": "🛡️ mini-mod-chat",
-    "mods-chat": "🛠️ mods-chat",
-    "staff-bot-commands": "⚙️ staff-bot-commands",
+    "prison": "🔒prison",
+    "quarantine": "☣️quarantine",
+    "bot-commands": "🤖bot-commands",
+    "cosmic-videos": "🌌cosmic-videos",
+    "cosmic-twitter": "🐦cosmic-twitter",
+    "to-do": "📋to-do",
+    "mini-mod-chat": "🛡️mini-mod-chat",
+    "mods-chat": "🛠️mods-chat",
+    "staff-bot-commands": "⚙️staff-bot-commands",
     "Staff Senate": "🏛️ Staff Senate",
 
     # Server Logs
-    "join-leave-logs": "🚪 join-leave-logs",
-    "warn-logs": "⚠️ warn-logs",
-    "role-logs": "🏷️ role-logs",
-    "kick-logs": "🥾 kick-logs",
-    "message-delete-logs": "🗑️ message-delete-logs",
-    "ban-logs": "🔨 ban-logs",
-    "message-edit-logs": "✏️ message-edit-logs",
-    "bulk-delete-logs": "🧹 bulk-delete-logs",
-    "admin-mod-logs": "🛡️ admin-mod-logs",
-    "member-update-logs": "🔄 member-update-logs",
-    "voice-logs": "🎤 voice-logs",
-    "quarantine-logs": "☣️ quarantine-logs",
+    "join-leave-logs": "🚪join-leave-logs",
+    "warn-logs": "⚠️warn-logs",
+    "role-logs": "🏷️role-logs",
+    "kick-logs": "🥾kick-logs",
+    "message-delete-logs": "🗑️message-delete-logs",
+    "ban-logs": "🔨ban-logs",
+    "message-edit-logs": "✏️message-edit-logs",
+    "bulk-delete-logs": "🧹bulk-delete-logs",
+    "admin-mod-logs": "🛡️admin-mod-logs",
+    "member-update-logs": "🔄member-update-logs",
+    "voice-logs": "🎤voice-logs",
+    "quarantine-logs": "☣️quarantine-logs",
 }
+
+
+def _match_channel_emoji(channel_name: str):
+    """
+    Matches a channel name to an entry in CHANNEL_EMOJI_MAP.
+    Accounts for raw channel names, previous prefix runs (with space or hyphen),
+    and target names that are already applied.
+    Returns: (matched_key, target_name, is_already_set)
+    """
+    norm_cname = channel_name.strip().replace("’", "'")
+    for key, target_name in CHANNEL_EMOJI_MAP.items():
+        norm_key = key.strip().replace("’", "'")
+        norm_target = target_name.strip().replace("’", "'")
+        prefix = target_name[:-len(key)]
+        norm_prefix = prefix.strip()
+
+        # Check if already set to target (or hyphenated for text channels)
+        if norm_cname == norm_target or norm_cname == norm_target.replace(" ", "-"):
+            return key, target_name, True
+
+        # Check base key
+        if norm_cname == norm_key:
+            return key, target_name, False
+
+        # Check previous prefix variants (e.g., emoji-channel or emoji channel)
+        if norm_cname == f"{norm_prefix}-{norm_key}" or norm_cname == f"{norm_prefix} {norm_key}":
+            return key, target_name, False
+
+    return None, None, False
 
 
 @bot.command(
@@ -282,11 +316,16 @@ CHANNEL_EMOJI_MAP = {
 @commands.guild_only()
 @commands.has_permissions(administrator=True)
 @commands.bot_has_permissions(administrator=True)
-async def emojify_channels(ctx):
+async def emojify_channels(ctx, mode: str = None):
     """
     Edits server channel titles to add emoji prefixes based on CHANNEL_EMOJI_MAP.
+    Pass 'revert' as an argument to restore original channel names.
     Requires administrator permissions for both the command invoker and the bot.
     """
+    if mode and mode.lower() in ["revert", "undo", "reset", "clean", "remove"]:
+        await revert_channels(ctx)
+        return
+
     if not ctx.guild:
         await ctx.send("🚫 This command can only be used in a server.")
         return
@@ -308,51 +347,31 @@ async def emojify_channels(ctx):
     failed = []
     matched_keys = set()
 
-    # Pre-check: identify channels that already have target emoji titles
     for channel in ctx.guild.channels:
         if isinstance(channel, discord.CategoryChannel):
             continue
 
-        for original_key, target_name in CHANNEL_EMOJI_MAP.items():
-            if channel.name == target_name or channel.name == target_name.replace(" ", "-"):
-                matched_keys.add(original_key)
-                skipped.append(f"`{channel.name}` (already set)")
-                break
-
-    for channel in ctx.guild.channels:
-        if isinstance(channel, discord.CategoryChannel):
+        matched_key, target_name, is_already_set = _match_channel_emoji(channel.name)
+        if not matched_key:
             continue
 
-        target_name = None
-        matched_key = None
+        matched_keys.add(matched_key)
 
-        if channel.name in CHANNEL_EMOJI_MAP:
-            matched_key = channel.name
-            target_name = CHANNEL_EMOJI_MAP[channel.name]
-        else:
-            clean_name = channel.name.strip().replace("’", "'")
-            for key, val in CHANNEL_EMOJI_MAP.items():
-                if clean_name == key.replace("’", "'"):
-                    matched_key = key
-                    target_name = val
-                    break
+        if is_already_set:
+            skipped.append(f"`{channel.name}` (already set)")
+            continue
 
-        if matched_key and target_name:
-            matched_keys.add(matched_key)
-            if channel.name == target_name or channel.name == target_name.replace(" ", "-"):
-                continue
-
-            try:
-                old_name = channel.name
-                await channel.edit(name=target_name, reason="Temporary channel emoji update")
-                updated.append(f"`{old_name}` ➔ `{target_name}`")
-                await asyncio.sleep(1.0)
-            except discord.Forbidden:
-                failed.append((channel.name, "Forbidden / Missing Permissions"))
-            except discord.HTTPException as e:
-                failed.append((channel.name, f"HTTP {e.status}: {e.text}"))
-            except Exception as e:
-                failed.append((channel.name, str(e)))
+        try:
+            old_name = channel.name
+            await channel.edit(name=target_name, reason="Temporary channel emoji update")
+            updated.append(f"`{old_name}` ➔ `{target_name}`")
+            await asyncio.sleep(1.0)
+        except discord.Forbidden:
+            failed.append((channel.name, "Forbidden / Missing Permissions"))
+        except discord.HTTPException as e:
+            failed.append((channel.name, f"HTTP {e.status}: {e.text}"))
+        except Exception as e:
+            failed.append((channel.name, str(e)))
 
     not_found = sorted(list(set(CHANNEL_EMOJI_MAP.keys()) - matched_keys))
 
@@ -369,6 +388,100 @@ async def emojify_channels(ctx):
         if len(updated) > 15:
             up_str += f"\n... and {len(updated) - 15} more"
         embed.add_field(name=f"Updated Channels ({len(updated)})", value=up_str[:1024], inline=False)
+
+    if not_found:
+        nf_str = ", ".join(f"`{k}`" for k in not_found)
+        if len(nf_str) > 1000:
+            nf_str = nf_str[:997] + "..."
+        embed.add_field(name=f"⚠️ Not Found in Server ({len(not_found)})", value=nf_str[:1024], inline=False)
+
+    if failed:
+        fail_str = "\n".join(f"• `{name}`: {err}" for name, err in failed[:10])
+        embed.add_field(name="Errors", value=fail_str[:1024], inline=False)
+
+    try:
+        await status_msg.edit(content=None, embed=embed)
+    except Exception:
+        await ctx.send(embed=embed)
+
+
+@bot.command(
+    name="revert_channels",
+    aliases=["unemojify_channels", "revert_channel_emojis", "unemojify", "clear_channel_emojis"],
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(administrator=True)
+async def revert_channels(ctx):
+    """
+    Reverts server channel titles back to their original names without emoji prefixes.
+    Requires administrator permissions for both the command invoker and the bot.
+    """
+    if not ctx.guild:
+        await ctx.send("🚫 This command can only be used in a server.")
+        return
+
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("🚫 You must have Administrator permissions to run this command.")
+        return
+
+    if not ctx.guild.me.guild_permissions.administrator:
+        await ctx.send("🚫 The bot must have Administrator permissions to run this command.")
+        return
+
+    status_msg = await ctx.send(
+        f"⏳ Processing channel revert ({len(CHANNEL_EMOJI_MAP)} mapped entries)... Please wait."
+    )
+
+    reverted = []
+    skipped = []
+    failed = []
+    matched_keys = set()
+
+    for channel in ctx.guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+
+        matched_key, _, _ = _match_channel_emoji(channel.name)
+        if not matched_key:
+            continue
+
+        matched_keys.add(matched_key)
+        original_name = matched_key
+
+        clean_cname = channel.name.strip().replace("’", "'")
+        clean_oname = original_name.strip().replace("’", "'")
+        if clean_cname == clean_oname:
+            skipped.append(f"`{channel.name}` (already clean)")
+            continue
+
+        try:
+            old_name = channel.name
+            await channel.edit(name=original_name, reason="Reverting channel emojis to original titles")
+            reverted.append(f"`{old_name}` ➔ `{original_name}`")
+            await asyncio.sleep(1.0)
+        except discord.Forbidden:
+            failed.append((channel.name, "Forbidden / Missing Permissions"))
+        except discord.HTTPException as e:
+            failed.append((channel.name, f"HTTP {e.status}: {e.text}"))
+        except Exception as e:
+            failed.append((channel.name, str(e)))
+
+    not_found = sorted(list(set(CHANNEL_EMOJI_MAP.keys()) - matched_keys))
+
+    embed = discord.Embed(
+        title="🔄 Channel Revert Complete",
+        color=discord.Color.green() if not failed else discord.Color.orange(),
+    )
+    embed.add_field(name="✅ Reverted", value=str(len(reverted)), inline=True)
+    embed.add_field(name="⏭️ Already Clean / Skipped", value=str(len(skipped)), inline=True)
+    embed.add_field(name="❌ Failed", value=str(len(failed)), inline=True)
+
+    if reverted:
+        rev_str = "\n".join(reverted[:15])
+        if len(reverted) > 15:
+            rev_str += f"\n... and {len(reverted) - 15} more"
+        embed.add_field(name=f"Reverted Channels ({len(reverted)})", value=rev_str[:1024], inline=False)
 
     if not_found:
         nf_str = ", ".join(f"`{k}`" for k in not_found)
