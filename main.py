@@ -1,5 +1,6 @@
 import os
 import sys
+import asyncio
 from dotenv import load_dotenv
 import discord
 from discord.ext import commands
@@ -78,6 +79,10 @@ async def on_command_error(ctx, error):
     # 5. Permission errors
     if isinstance(error, commands.MissingPermissions):
         await ctx.send("🚫 You don't have permission to use this command.")
+        return
+
+    if isinstance(error, commands.BotMissingPermissions):
+        await ctx.send("🚫 The bot lacks the required administrator permissions to perform this action.")
         return
 
     # 6. Catch internal code crashes (like UnboundLocalError or Forbidden) and send to Discord
@@ -166,6 +171,11 @@ async def help_command(ctx):
             "desc": "Triggers a container reboot and pulls latest code (Admin only).",
             "active": True,
         },
+        {
+            "name": "!emojify_channels",
+            "desc": "Edits server channel titles with their designated emoji prefixes (Admin only).",
+            "active": True,
+        },
     ]
 
     for cmd in commands_info:
@@ -189,6 +199,191 @@ async def restart(ctx):
     await ctx.send("🔄 Shutting down... Container will reboot and pull changes in a moment.")
     await bot.close()
     sys.exit(1)
+
+
+# ---------------------------------------------------------
+# Channel Emoji Mapping (Temporary Feature)
+# ---------------------------------------------------------
+CHANNEL_EMOJI_MAP = {
+    # Top Section & Info
+    "newcomers": "👋 newcomers",
+    "welcome": "🤝 welcome",
+    "rules": "📜 rules",
+    "announcements": "📢 announcements",
+    "custom-roles": "🎭 custom-roles",
+    "partnerships": "🔗 partnerships",
+    "glossary": "📖 glossary",
+    "random-questions": "❓ random-questions",
+
+    # Community & Discussion
+    "veterans-lounge": "☕ veterans-lounge",
+    "Veterans' discussion": "🎖️ Veterans' discussion",
+    "general": "💬 general",
+    "serious-discussion": "🧐 serious-discussion",
+    "Lounge 1": "🛋️ Lounge 1",
+    "Lounge 2": "🛋️ Lounge 2",
+    "history-culture": "🏛️ history-culture",
+    "philosophy": "🦉 philosophy",
+    "religion": "🕊️ religion",
+    "politics": "⚖️ politics",
+    "veganism": "🌱 veganism",
+    "science": "🔬 science",
+    "technology": "💻 technology",
+    "Discussion 1": "🎙️ Discussion 1",
+    "Discussion 2": "🎙️ Discussion 2",
+
+    # Varied Ventures & Media
+    "hobbies": "🎨 hobbies",
+    "food": "🥗 food",
+    "finance-and-investing": "📈 finance-and-investing",
+    "health-and-lifestyle": "🧘 health-and-lifestyle",
+    "animals-nature": "🐾 animals-nature",
+    "career-advice": "💼 career-advice",
+    "venting": "😤 venting",
+    "memes": "😂 memes",
+    "music-art": "🎵 music-art",
+    "screens-stories": "📸 screens-stories",
+    "gaming": "🎮 gaming",
+    "best-of-server-moments": "⭐ best-of-server-moments",
+    "Gaming": "🎧 Gaming",
+
+    # Moderation, Bots & Staff
+    "prison": "🔒 prison",
+    "quarantine": "☣️ quarantine",
+    "bot-commands": "🤖 bot-commands",
+    "cosmic-videos": "🌌 cosmic-videos",
+    "cosmic-twitter": "🐦 cosmic-twitter",
+    "to-do": "📋 to-do",
+    "mini-mod-chat": "🛡️ mini-mod-chat",
+    "mods-chat": "🛠️ mods-chat",
+    "staff-bot-commands": "⚙️ staff-bot-commands",
+    "Staff Senate": "🏛️ Staff Senate",
+
+    # Server Logs
+    "join-leave-logs": "🚪 join-leave-logs",
+    "warn-logs": "⚠️ warn-logs",
+    "role-logs": "🏷️ role-logs",
+    "kick-logs": "🥾 kick-logs",
+    "message-delete-logs": "🗑️ message-delete-logs",
+    "ban-logs": "🔨 ban-logs",
+    "message-edit-logs": "✏️ message-edit-logs",
+    "bulk-delete-logs": "🧹 bulk-delete-logs",
+    "admin-mod-logs": "🛡️ admin-mod-logs",
+    "member-update-logs": "🔄 member-update-logs",
+    "voice-logs": "🎤 voice-logs",
+    "quarantine-logs": "☣️ quarantine-logs",
+}
+
+
+@bot.command(
+    name="emojify_channels",
+    aliases=["update_channel_emojis", "set_channel_emojis", "channelemojis", "emojify"],
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(administrator=True)
+async def emojify_channels(ctx):
+    """
+    Edits server channel titles to add emoji prefixes based on CHANNEL_EMOJI_MAP.
+    Requires administrator permissions for both the command invoker and the bot.
+    """
+    if not ctx.guild:
+        await ctx.send("🚫 This command can only be used in a server.")
+        return
+
+    if not ctx.author.guild_permissions.administrator:
+        await ctx.send("🚫 You must have Administrator permissions to run this command.")
+        return
+
+    if not ctx.guild.me.guild_permissions.administrator:
+        await ctx.send("🚫 The bot must have Administrator permissions to run this command.")
+        return
+
+    status_msg = await ctx.send(
+        f"⏳ Processing channel emoji updates ({len(CHANNEL_EMOJI_MAP)} mapped entries)... Please wait."
+    )
+
+    updated = []
+    skipped = []
+    failed = []
+    matched_keys = set()
+
+    # Pre-check: identify channels that already have target emoji titles
+    for channel in ctx.guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+
+        for original_key, target_name in CHANNEL_EMOJI_MAP.items():
+            if channel.name == target_name or channel.name == target_name.replace(" ", "-"):
+                matched_keys.add(original_key)
+                skipped.append(f"`{channel.name}` (already set)")
+                break
+
+    for channel in ctx.guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+
+        target_name = None
+        matched_key = None
+
+        if channel.name in CHANNEL_EMOJI_MAP:
+            matched_key = channel.name
+            target_name = CHANNEL_EMOJI_MAP[channel.name]
+        else:
+            clean_name = channel.name.strip().replace("’", "'")
+            for key, val in CHANNEL_EMOJI_MAP.items():
+                if clean_name == key.replace("’", "'"):
+                    matched_key = key
+                    target_name = val
+                    break
+
+        if matched_key and target_name:
+            matched_keys.add(matched_key)
+            if channel.name == target_name or channel.name == target_name.replace(" ", "-"):
+                continue
+
+            try:
+                old_name = channel.name
+                await channel.edit(name=target_name, reason="Temporary channel emoji update")
+                updated.append(f"`{old_name}` ➔ `{target_name}`")
+                await asyncio.sleep(1.0)
+            except discord.Forbidden:
+                failed.append((channel.name, "Forbidden / Missing Permissions"))
+            except discord.HTTPException as e:
+                failed.append((channel.name, f"HTTP {e.status}: {e.text}"))
+            except Exception as e:
+                failed.append((channel.name, str(e)))
+
+    not_found = sorted(list(set(CHANNEL_EMOJI_MAP.keys()) - matched_keys))
+
+    embed = discord.Embed(
+        title="🏷️ Channel Emojis Update Complete",
+        color=discord.Color.green() if not failed else discord.Color.orange(),
+    )
+    embed.add_field(name="✅ Updated", value=str(len(updated)), inline=True)
+    embed.add_field(name="⏭️ Skipped / Already Set", value=str(len(skipped)), inline=True)
+    embed.add_field(name="❌ Failed", value=str(len(failed)), inline=True)
+
+    if updated:
+        up_str = "\n".join(updated[:15])
+        if len(updated) > 15:
+            up_str += f"\n... and {len(updated) - 15} more"
+        embed.add_field(name=f"Updated Channels ({len(updated)})", value=up_str[:1024], inline=False)
+
+    if not_found:
+        nf_str = ", ".join(f"`{k}`" for k in not_found)
+        if len(nf_str) > 1000:
+            nf_str = nf_str[:997] + "..."
+        embed.add_field(name=f"⚠️ Not Found in Server ({len(not_found)})", value=nf_str[:1024], inline=False)
+
+    if failed:
+        fail_str = "\n".join(f"• `{name}`: {err}" for name, err in failed[:10])
+        embed.add_field(name="Errors", value=fail_str[:1024], inline=False)
+
+    try:
+        await status_msg.edit(content=None, embed=embed)
+    except Exception:
+        await ctx.send(embed=embed)
 
 
 if __name__ == "__main__":
