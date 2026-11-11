@@ -767,7 +767,7 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.general.send.assert_awaited_once()
         msg = self.general.send.call_args.args[0]
         self.assertIn(m.mention, msg)
-        self.assertIn("10 seconds", msg)
+        self.assertIn("`lobby`", msg)
         self.assertIn("**Unc**", msg)
         self.assertNotIn("Total misclicks", msg)
 
@@ -840,9 +840,9 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.assertIn("just earned the **Unc** role for missclicking into the `lobby`", msg)
         self.assertNotIn("Total misclicks", msg)
 
-    async def test_first_solo_catch_differs_from_first_regular_message(self):
+    async def test_first_solo_catch_uses_first_message(self):
         msg = await self._catch(self._member(1), 10)
-        self.assertNotIn("missclicking into", msg)
+        self.assertIn("just earned the **Unc** role for missclicking into the `lobby`", msg)
         self.assertNotIn("Total misclicks", msg)
 
     async def test_non_first_regular_catch_contains_channel(self):
@@ -872,3 +872,41 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
             m = self._member(1)
             seen.add((await self._catch(m, 2, others=True)).split("(Total")[0].replace("<@1>", ""))
         self.assertGreaterEqual(len(seen), 5)
+
+    async def test_solo_stay_under_or_equal_10s_never_uses_dodge_or_trick_messages(self):
+        await self._set_count(1, 20)
+        dodge_indicators = ["dodge", "hide", "hoping", "trick", "pretending", "Nice try"]
+        for _ in range(40):
+            self.cog.unc_cooldowns.clear()
+            self.channel.members.clear()
+            m = self._member(1)
+            msg = await self._catch(m, 5)
+            for indicator in dodge_indicators:
+                self.assertNotIn(indicator, msg)
+
+    async def test_solo_stay_boundary_exactly_10s_does_not_use_dodge_message(self):
+        await self._set_count(1, 20)
+        dodge_indicators = ["dodge", "hide", "hoping", "trick", "pretending", "Nice try"]
+        for _ in range(40):
+            self.cog.unc_cooldowns.clear()
+            self.channel.members.clear()
+            m = self._member(1)
+            msg = await self._catch(m, 10)
+            for indicator in dodge_indicators:
+                self.assertNotIn(indicator, msg)
+
+    async def test_solo_stay_over_10s_uses_dodge_messages(self):
+        await self._set_count(1, 20)
+        dodge_indicators = ["dodge", "hide", "hoping the bot wouldn't notice", "trick", "pretending", "Nice try"]
+        for _ in range(40):
+            self.cog.unc_cooldowns.clear()
+            self.channel.members.clear()
+            m = self._member(1)
+            msg = await self._catch(m, 12)
+            self.assertTrue(any(indicator in msg for indicator in dodge_indicators), f"Expected dodge indicator in message: {msg}")
+
+    async def test_unc_solo_dodge_min_seconds_from_env(self):
+        with patch.dict(os.environ, {"UNC_SOLO_DODGE_MIN_SECONDS": "5.0"}):
+            cog = Moderation(MagicMock(), db=self.db)
+            self.assertEqual(cog.unc_solo_dodge_min_seconds, 5.0)
+

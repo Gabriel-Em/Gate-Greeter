@@ -35,21 +35,24 @@ UNC_MISCLICK_MESSAGES = (
     "🏠 'Whoops, wrong house!' {member} just stumbled into `{channel}` and tripped on the way out.",
     "📺 {member} thought the Discord channel list was a TV guide. Another misclick into `{channel}`!",
     "🖱️ {member} was typing with their index fingers and accidentally double-clicked their way into `{channel}`.",
-    "👴 Someone come collect {member}, they just wandered into `{channel}` looking for the bingo hall."
+    "👴 Someone come collect {member}, they just wandered into `{channel}` looking for the bingo hall.",
     "📠 {member} tried to send a fax but somehow clicked into `{channel}` instead.",
     "👓 {member} couldn't find their reading glasses and accidentally wandered into `{channel}`.",
 )
 
 UNC_SOLO_MESSAGES = (
-    "👴 {member} thought they could dodge the timer by waiting in `{channel}` for {d_time} seconds... completely alone. Still caught you.",
     "👻 {member} just spent {d_time} seconds talking to ghosts in an empty voice channel. The meds are wearing off!",
     "🧭 Someone get {member} a map. Bro wandered into an empty voice channel, stood there for {d_time} seconds, and slowly walked out.",
-    "🕵️ Nice try, {member}. Sitting in an empty channel for {d_time} seconds doesn't hide the misclick.",
     "🦉 *crickets*... That's what {member} heard for {d_time} seconds before realizing they were in the wrong channel.",
-    "🤡 {member} really sat in silence in the voice channel for {d_time} seconds hoping the bot wouldn't notice. Unc status secured.",
     "🧓 Has anyone checked on {member}? They just stared at the walls of an empty voice channel for {d_time} seconds.",
-    "🛑 {member} tried the 'stand perfectly still in `{channel}` so the bot doesn't see me' trick for {d_time} seconds. It didn't work.",
     "🕸️ {member} got lost in the cobwebs of `{channel}` for {d_time} seconds all by themselves.",
+)
+
+UNC_SOLO_DODGE_MESSAGES = (
+    "👴 {member} thought they could dodge the timer by waiting in `{channel}` for {d_time} seconds... completely alone. Still caught you.",
+    "🕵️ Nice try, {member}. Sitting in an empty channel for {d_time} seconds doesn't hide the misclick.",
+    "🤡 {member} really sat in silence in the voice channel for {d_time} seconds hoping the bot wouldn't notice. Unc status secured.",
+    "🛑 {member} tried the 'stand perfectly still in `{channel}` so the bot doesn't see me' trick for {d_time} seconds. It didn't work.",
     "📟 {member} spent {d_time} seconds alone in `{channel}` pretending that was the plan. The Unc council disagrees.",
 )
 
@@ -165,6 +168,7 @@ class Moderation(commands.Cog):
         self.trust_cooldown_seconds = get_env_int("TRUST_COOLDOWN_SECONDS", 60)
         self.unc_misclick_max_seconds = get_env_float("UNC_MISCLICK_MAX_SECONDS", 3.0)
         self.unc_solo_max_seconds = get_env_float("UNC_SOLO_MAX_SECONDS", 25.0)
+        self.unc_solo_dodge_min_seconds = get_env_float("UNC_SOLO_DODGE_MIN_SECONDS", 10.0)
         self.unc_cooldown_seconds = get_env_int("UNC_COOLDOWN_SECONDS", 3600)
         self.anti_nuke_limit = get_env_int("ANTI_NUKE_CHANNEL_LIMIT", 2)
         self.anti_nuke_window = get_env_int("ANTI_NUKE_WINDOW_SECONDS", 600)
@@ -408,15 +412,14 @@ class Moderation(commands.Cog):
                             if general_channel:
                                 role_name = target_role.name
                                 solo_case = was_solo and duration >= self.unc_misclick_max_seconds
+                                is_dodge = solo_case and duration > self.unc_solo_dodge_min_seconds
                                 fmt = {
                                     "member": member.mention,
                                     "channel": before.channel.name,
                                     "d_time": int(duration),
                                     "role": role_name,
                                 }
-                                if current_count == 1 and solo_case:
-                                    msg = f"🪑 {member.mention} sat alone in `{before.channel.name}` for {int(duration)} seconds hoping nobody would notice, and just earned the **{role_name}** role anyway!"
-                                elif current_count == 1:
+                                if current_count == 1:
                                     msg = f"👴 {member.mention} just earned the **{role_name}** role for missclicking into the `{before.channel.name}` voice channel!"
                                 elif current_count == 5:
                                     msg = f"🌟 **LEVEL UP!** {member.mention} misclicked for the 5th time and evolved into a **{role_name}**!"
@@ -427,7 +430,12 @@ class Moderation(commands.Cog):
                                 elif current_count == 20:
                                     msg = f"👑 **MAX LEVEL!** {member.mention} achieved 20 misclicks and has ascended to **{role_name}**!"
                                 else:
-                                    templates = UNC_SOLO_MESSAGES if solo_case else UNC_MISCLICK_MESSAGES
+                                    if is_dodge:
+                                        templates = UNC_SOLO_DODGE_MESSAGES
+                                    elif solo_case:
+                                        templates = UNC_SOLO_MESSAGES
+                                    else:
+                                        templates = UNC_MISCLICK_MESSAGES
                                     msg = random.choice(templates).format(**fmt)
 
                                 await general_channel.send(msg)
