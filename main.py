@@ -229,7 +229,7 @@ CHANNEL_EMOJI_MAP = {
     "veterans-lounge": "☕veterans-lounge",
     "Veterans' discussion": "🎖️ Veterans' discussion",
     "general": "💬general",
-    "serious-discussion": "🧐serious-discussion",
+    "serious-discussion": "🔍serious-discussion",
     "Lounge 1": "🛋️ Lounge 1",
     "Lounge 2": "🛋️ Lounge 2",
     "history-culture": "🏛️history-culture",
@@ -249,8 +249,8 @@ CHANNEL_EMOJI_MAP = {
     "health-and-lifestyle": "🧘health-and-lifestyle",
     "animals-nature": "🐾animals-nature",
     "career-advice": "💼career-advice",
-    "venting": "😤venting",
-    "memes": "😂memes",
+    "venting": "🗯️venting",
+    "memes": "🐸memes",
     "music-art": "🎵music-art",
     "screens-stories": "📸screens-stories",
     "gaming": "🎮gaming",
@@ -285,6 +285,7 @@ CHANNEL_EMOJI_MAP = {
 }
 
 
+LEGACY_EMOJI = {"serious-discussion": "🧐", "venting": "😤", "memes": "😂"}
 CHANNEL_SEPARATORS = {"bar": "｜", "dots": "┊"}
 
 
@@ -309,6 +310,13 @@ def _match_channel_emoji(channel_name: str):
         # Check base key
         if norm_cname == norm_key:
             return key, target_name, False
+
+        # Check previous emoji (with or without separators)
+        old = LEGACY_EMOJI.get(key)
+        if old:
+            for mid in ["", " ", "-"] + list(CHANNEL_SEPARATORS.values()):
+                if norm_cname == f"{old}{mid}{norm_key}":
+                    return key, target_name, False
 
         # Check previous prefix variants (e.g., emoji-channel or emoji channel)
         if norm_cname == f"{norm_prefix}-{norm_key}" or norm_cname == f"{norm_prefix} {norm_key}":
@@ -440,7 +448,8 @@ async def channel_separator(ctx, style: str = None):
         if not key:
             continue
         prefix = target_name[:-len(key)].strip()
-        new_name = f"{prefix}{sep}{key}"
+        is_voice = target_name[len(prefix):len(prefix) + 1] == " "
+        new_name = target_name if is_voice else f"{prefix}{sep}{key}"
         if channel.name == new_name:
             skipped += 1
             continue
