@@ -17,6 +17,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
   - If an imprisoned or quarantined user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, drags them back into prison or quarantine, and logs the evasion attempt.
   - Monitors member role updates in real time (`on_member_update`) and immediately strips any unauthorized self-assigned or onboarding roles acquired while a user is in Quarantine or Prison.
 - **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s), or sitting completely alone in an empty channel for up to `UNC_SOLO_MAX_SECONDS` (default 25s), and assigns them the "Unc" role. Solo stays longer than `UNC_SOLO_DODGE_MIN_SECONDS` (default 10.0s) trigger dedicated timer-dodging and tricking callouts, whereas shorter solo stays use harmless wandering templates. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently in the database, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
+  - **Anti-gaming protection (rolling trap)**: every short stay is recorded. If a user is currently shadowbanned, further short stays are silently ignored and extend the lockout by `UNC_ABUSE_LOCKOUT_SECONDS` (default 6 hours). When the user accumulates `UNC_ABUSE_THRESHOLD` (default 5) short stays within `UNC_ABUSE_WINDOW_SECONDS` (default 7 days / 604800s), they receive a public roast, are not awarded, and are locked out for 6 hours. History is never cleared on lockout and only leaves the record by naturally aging out of the 7-day rolling window. If the lockout expires and they still have 5+ short stays within the 7-day window, their next attempt triggers another roast and reapplies the 6-hour lockout. Cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour) applies to awards between normal misclicks. Lockouts and roasts do not demote a user or strip previously earned Unc roles. Cooldown, lockout, and history are stored in SQLite and survive restarts.
 - **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions. Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
 - **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
 
@@ -109,6 +110,9 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    UNC_SOLO_DODGE_MIN_SECONDS=10.0
    UNC_SOLO_MAX_SECONDS=25.0
    UNC_COOLDOWN_SECONDS=3600
+   UNC_ABUSE_THRESHOLD=5
+   UNC_ABUSE_WINDOW_SECONDS=604800
+   UNC_ABUSE_LOCKOUT_SECONDS=21600
    ANTI_NUKE_CHANNEL_LIMIT=2
    ANTI_NUKE_WINDOW_SECONDS=600
 

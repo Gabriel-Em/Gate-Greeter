@@ -56,6 +56,18 @@ UNC_SOLO_DODGE_MESSAGES = (
     "📟 {member} spent {d_time} seconds alone in `{channel}` pretending that was the plan. The Unc council disagrees.",
 )
 
+UNC_ABUSE_MESSAGES = (
+    "📉 {member} tried to farm misclicks in {channel} but just exposed themselves as a tryhard. Unc privileges revoked.",
+    "🚨 {member} just got caught gaming the misclick system in {channel}. Try harder, boomer.",
+    "🕵️ Nice try, {member}, but spamming {channel} won't get you a higher Unc level any faster. Sit down.",
+    "🤡 {member} really thought they could speedrun Unc levels in {channel} by joining and leaving repeatedly. We see you.",
+    "⚙️ {member} thinks they found a loophole by spam-clicking {channel}. The bot is onto you, granddad.",
+)
+
+UNC_VERDICT_AWARD = "AWARD"
+UNC_VERDICT_SILENT = "SILENT"
+UNC_VERDICT_ROAST = "ROAST"
+
 class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"quarantine:release:(?P<user_id>[0-9]+)"):
     def __init__(self, user_id: int = 0):
         super().__init__(
@@ -133,7 +145,6 @@ class Moderation(commands.Cog):
 
         # Runtime Memory Trackers
         self.voice_join_times = {}
-        self.unc_cooldowns = {}
         self.trust_cooldowns = {}
         self.channel_deletions = {}
 
@@ -170,6 +181,9 @@ class Moderation(commands.Cog):
         self.unc_solo_max_seconds = get_env_float("UNC_SOLO_MAX_SECONDS", 25.0)
         self.unc_solo_dodge_min_seconds = get_env_float("UNC_SOLO_DODGE_MIN_SECONDS", 10.0)
         self.unc_cooldown_seconds = get_env_int("UNC_COOLDOWN_SECONDS", 3600)
+        self.unc_abuse_threshold = get_env_int("UNC_ABUSE_THRESHOLD", 5)
+        self.unc_abuse_window_seconds = get_env_int("UNC_ABUSE_WINDOW_SECONDS", 604800)
+        self.unc_abuse_lockout_seconds = get_env_int("UNC_ABUSE_LOCKOUT_SECONDS", 21600)
         self.anti_nuke_limit = get_env_int("ANTI_NUKE_CHANNEL_LIMIT", 2)
         self.anti_nuke_window = get_env_int("ANTI_NUKE_WINDOW_SECONDS", 600)
 
@@ -348,6 +362,66 @@ class Moderation(commands.Cog):
         return None
 
     # ---------------------------------------------------------
+    # UNC ANTI-ABUSE
+    # ---------------------------------------------------------
+    async def _classify_unc_attempt(self, user_id, channel_id, joined_at, left_at) -> str:
+        """Classifies a short voice stay as AWARD, SILENT or ROAST.
+
+        Evaluates in this exact order:
+        1. Always Record: Insert every short stay into unc_short_stays.
+        2. The Trap (Shadowban check): If now < state.locked_until, update
+           locked_until = now + UNC_ABUSE_LOCKOUT_SECONDS and return SILENT.
+        3. The 7-Day Threshold Check: If count >= UNC_ABUSE_THRESHOLD, set
+           locked_until = now + UNC_ABUSE_LOCKOUT_SECONDS and return ROAST.
+        4. Standard Cooldown Check: If now - state.last_counted < UNC_COOLDOWN_SECONDS,
+           return SILENT.
+        5. Legitimate Award: Update last_counted = now and return AWARD.
+        """
+        left_ts = left_at.timestamp()
+        joined_ts = joined_at.timestamp()
+        window_start = left_ts - self.unc_abuse_window_seconds
+        async with self.unc_lock:
+            # 1. Always Record
+            await self.db.add_unc_short_stay(user_id, channel_id, joined_ts, left_ts, window_start)
+            state = await self.db.get_unc_state(user_id)
+
+            # 2. The Trap (Shadowban check)
+            locked_until = state["locked_until"]
+            if locked_until is not None and left_ts < locked_until:
+                await self.db.set_unc_lockout(user_id, left_ts + self.unc_abuse_lockout_seconds)
+                return UNC_VERDICT_SILENT
+
+            # 3. The 7-Day Threshold Check
+            recent = await self.db.get_unc_short_stays(user_id, window_start)
+            if len(recent) >= self.unc_abuse_threshold:
+                await self.db.set_unc_lockout(user_id, left_ts + self.unc_abuse_lockout_seconds)
+                return UNC_VERDICT_ROAST
+
+            # 4. Standard Cooldown Check
+            last_counted = state["last_counted"]
+            if last_counted is not None and left_ts - last_counted < self.unc_cooldown_seconds:
+                return UNC_VERDICT_SILENT
+
+            # 5. Legitimate Award
+            await self.db.set_unc_last_counted(user_id, left_ts)
+            return UNC_VERDICT_AWARD
+
+    async def _announce_unc_abuse(self, member, channel) -> None:
+        general_channel = member.guild.get_channel(self.general_channel_id)
+        if not general_channel:
+            return
+        msg = random.choice(UNC_ABUSE_MESSAGES).format(
+            member=member.mention, channel=channel.name
+        )
+        try:
+            await general_channel.send(msg)
+        except discord.HTTPException:
+            print(f"⚠️ Could not announce unc abuse flag for {member.name}.")
+            return
+        log_msg = msg.replace(member.mention, member.name)
+        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
+
+    # ---------------------------------------------------------
     # VOICE MISCLICK TRACKER (The Unc Dynasty)
     # ---------------------------------------------------------
     @commands.Cog.listener()
@@ -365,12 +439,14 @@ class Moderation(commands.Cog):
 
                 was_solo = record.get("alone", False) and duration < self.unc_solo_max_seconds
                 if duration < self.unc_misclick_max_seconds or was_solo:
-                    last_misclick = self.unc_cooldowns.get(member.id)
-                    if last_misclick and (now - last_misclick).total_seconds() < self.unc_cooldown_seconds:
+                    verdict = await self._classify_unc_attempt(
+                        member.id, before.channel.id, record["time"], now
+                    )
+                    if verdict != UNC_VERDICT_AWARD:
+                        if verdict == UNC_VERDICT_ROAST:
+                            await self._announce_unc_abuse(member, before.channel)
                         self.voice_join_times.pop(member.id, None)
                         return
-
-                    self.unc_cooldowns[member.id] = now
 
                     # Ensure UNC_ROLE_IDS has all 5 tiers configured
                     if len(self.unc_role_ids) < 5:

@@ -108,6 +108,28 @@ class Database:
                 );
             """)
 
+            # 6b. Moderation: Unc anti-abuse state (cooldown, lockout) and short-stay history
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS unc_state (
+                    user_id INTEGER PRIMARY KEY,
+                    last_counted REAL,
+                    locked_until REAL
+                );
+            """)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS unc_short_stays (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER NOT NULL,
+                    channel_id INTEGER NOT NULL,
+                    joined_at REAL NOT NULL,
+                    left_at REAL NOT NULL
+                );
+            """)
+            conn.execute("""
+                CREATE INDEX IF NOT EXISTS idx_unc_short_stays_user
+                ON unc_short_stays (user_id, left_at);
+            """)
+
             # 7. Moderation: Trusted Media Interaction Points
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS trust_records (
@@ -823,6 +845,105 @@ class Database:
                 ON CONFLICT(user_id) DO UPDATE SET count = excluded.count;
                 """,
                 (user_id, count),
+            )
+
+    async def get_unc_state(self, user_id: int) -> Dict[str, Any]:
+        """Returns the last counted time and lockout end for a user."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_unc_state, user_id)
+
+    def _sync_get_unc_state(self, user_id: int) -> Dict[str, Any]:
+        conn = self._get_connection()
+        cur = conn.execute(
+            "SELECT last_counted, locked_until FROM unc_state WHERE user_id = ?;",
+            (user_id,),
+        )
+        row = cur.fetchone()
+        if row is None:
+            return {"last_counted": None, "locked_until": None}
+        return {"last_counted": row["last_counted"], "locked_until": row["locked_until"]}
+
+    async def set_unc_last_counted(self, user_id: int, timestamp: float) -> None:
+        async with self._lock:
+            await asyncio.to_thread(self._sync_set_unc_last_counted, user_id, timestamp)
+
+    def _sync_set_unc_last_counted(self, user_id: int, timestamp: float) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO unc_state (user_id, last_counted)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET last_counted = excluded.last_counted;
+                """,
+                (user_id, timestamp),
+            )
+
+    async def set_unc_lockout(self, user_id: int, locked_until: float) -> None:
+        """Sets the lockout end for a user without clearing history."""
+        async with self._lock:
+            await asyncio.to_thread(self._sync_set_unc_lockout, user_id, locked_until)
+
+    def _sync_set_unc_lockout(self, user_id: int, locked_until: float) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                """
+                INSERT INTO unc_state (user_id, locked_until)
+                VALUES (?, ?)
+                ON CONFLICT(user_id) DO UPDATE SET locked_until = excluded.locked_until;
+                """,
+                (user_id, locked_until),
+            )
+
+    async def get_unc_short_stays(self, user_id: int, since: float) -> List[Dict[str, Any]]:
+        """Returns the user's short stays that ended at or after `since`, oldest first."""
+        async with self._lock:
+            return await asyncio.to_thread(self._sync_get_unc_short_stays, user_id, since)
+
+    def _sync_get_unc_short_stays(self, user_id: int, since: float) -> List[Dict[str, Any]]:
+        conn = self._get_connection()
+        cur = conn.execute(
+            """
+            SELECT channel_id, joined_at, left_at FROM unc_short_stays
+            WHERE user_id = ? AND left_at >= ?
+            ORDER BY left_at ASC, id ASC;
+            """,
+            (user_id, since),
+        )
+        return [
+            {
+                "channel_id": row["channel_id"],
+                "joined_at": row["joined_at"],
+                "left_at": row["left_at"],
+            }
+            for row in cur.fetchall()
+        ]
+
+    async def add_unc_short_stay(
+        self, user_id: int, channel_id: int, joined_at: float, left_at: float, keep_since: float
+    ) -> None:
+        """Records a short stay and prunes that user's stays that ended before `keep_since`."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._sync_add_unc_short_stay, user_id, channel_id, joined_at, left_at, keep_since
+            )
+
+    def _sync_add_unc_short_stay(
+        self, user_id: int, channel_id: int, joined_at: float, left_at: float, keep_since: float
+    ) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                "DELETE FROM unc_short_stays WHERE user_id = ? AND left_at < ?;",
+                (user_id, keep_since),
+            )
+            conn.execute(
+                """
+                INSERT INTO unc_short_stays (user_id, channel_id, joined_at, left_at)
+                VALUES (?, ?, ?, ?);
+                """,
+                (user_id, channel_id, joined_at, left_at),
             )
 
     # ---------------------------------------------------------

@@ -163,6 +163,115 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(del_rec["type"], "automod")
         self.assertFalse(await self.db.has_quarantine_record(888))
 
+    async def test_unc_state_defaults_for_unknown_user(self):
+        state = await self.db.get_unc_state(4040)
+        self.assertEqual(state, {"last_counted": None, "locked_until": None})
+
+    async def test_unc_last_counted_roundtrip_and_overwrite(self):
+        await self.db.set_unc_last_counted(1, 1000.5)
+        self.assertEqual((await self.db.get_unc_state(1))["last_counted"], 1000.5)
+        await self.db.set_unc_last_counted(1, 2000.25)
+        self.assertEqual((await self.db.get_unc_state(1))["last_counted"], 2000.25)
+        self.assertIsNone((await self.db.get_unc_state(2))["last_counted"])
+
+    async def test_unc_state_survives_reopening_database(self):
+        await self.db.set_unc_last_counted(1, 1234.0)
+        await self.db.set_unc_lockout(1, 9999.0)
+        await self.db.add_unc_short_stay(1, 10, 1.0, 2.0, 0.0)
+        await self.db.close()
+        reopened = Database(self.test_db_path)
+        try:
+            state = await reopened.get_unc_state(1)
+            self.assertEqual(state, {"last_counted": 1234.0, "locked_until": 9999.0})
+            self.assertEqual(len(await reopened.get_unc_short_stays(1, 0.0)), 1)
+        finally:
+            await reopened.close()
+
+    async def test_unc_state_table_columns(self):
+        conn = self.db._get_connection()
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(unc_state);")]
+        self.assertEqual(columns, ["user_id", "last_counted", "locked_until"])
+
+    async def test_unc_short_stays_table_columns(self):
+        conn = self.db._get_connection()
+        columns = [row["name"] for row in conn.execute("PRAGMA table_info(unc_short_stays);")]
+        self.assertIn("user_id", columns)
+        self.assertIn("channel_id", columns)
+        self.assertIn("joined_at", columns)
+        self.assertIn("left_at", columns)
+
+    async def test_unc_lockout_preserves_last_counted_and_vice_versa(self):
+        await self.db.set_unc_last_counted(1, 50.0)
+        await self.db.set_unc_lockout(1, 500.0)
+        await self.db.set_unc_last_counted(1, 60.0)
+        self.assertEqual(
+            await self.db.get_unc_state(1),
+            {"last_counted": 60.0, "locked_until": 500.0},
+        )
+
+    async def test_unc_lockout_overwrites_previous_lockout(self):
+        await self.db.set_unc_lockout(1, 500.0)
+        await self.db.set_unc_lockout(1, 900.0)
+        self.assertEqual((await self.db.get_unc_state(1))["locked_until"], 900.0)
+
+    async def test_unc_lockout_creates_state_for_unknown_user(self):
+        await self.db.set_unc_lockout(7, 123.0)
+        self.assertEqual(
+            await self.db.get_unc_state(7),
+            {"last_counted": None, "locked_until": 123.0},
+        )
+
+    async def test_unc_lockout_does_not_affect_other_users(self):
+        await self.db.set_unc_lockout(1, 500.0)
+        await self.db.set_unc_lockout(2, 900.0)
+        self.assertEqual((await self.db.get_unc_state(1))["locked_until"], 500.0)
+        self.assertEqual((await self.db.get_unc_state(2))["locked_until"], 900.0)
+
+    async def test_unc_short_stays_empty_for_unknown_user(self):
+        self.assertEqual(await self.db.get_unc_short_stays(1, 0.0), [])
+
+    async def test_unc_short_stays_filtered_by_window_and_user_and_ordered(self):
+        await self.db.add_unc_short_stay(1, 11, 300.0, 302.0, 0.0)
+        await self.db.add_unc_short_stay(1, 10, 100.0, 101.0, 0.0)
+        await self.db.add_unc_short_stay(2, 10, 200.0, 201.0, 0.0)
+        both = [
+            {"channel_id": 10, "joined_at": 100.0, "left_at": 101.0},
+            {"channel_id": 11, "joined_at": 300.0, "left_at": 302.0},
+        ]
+        self.assertEqual(await self.db.get_unc_short_stays(1, 0.0), both)
+        self.assertEqual(await self.db.get_unc_short_stays(1, 101.0), both)
+        self.assertEqual(await self.db.get_unc_short_stays(1, 101.5), both[1:])
+
+    async def test_unc_add_short_stay_prunes_only_that_users_expired_rows(self):
+        await self.db.add_unc_short_stay(1, 10, 1.0, 2.0, 0.0)
+        await self.db.add_unc_short_stay(2, 10, 1.0, 2.0, 0.0)
+        await self.db.add_unc_short_stay(1, 10, 500.0, 501.0, 400.0)
+        self.assertEqual(
+            await self.db.get_unc_short_stays(1, 0.0),
+            [{"channel_id": 10, "joined_at": 500.0, "left_at": 501.0}],
+        )
+        self.assertEqual(len(await self.db.get_unc_short_stays(2, 0.0)), 1)
+
+    async def test_unc_add_short_stay_keeps_row_exactly_at_prune_boundary(self):
+        await self.db.add_unc_short_stay(1, 10, 1.0, 400.0, 0.0)
+        await self.db.add_unc_short_stay(1, 10, 500.0, 501.0, 400.0)
+        self.assertEqual(len(await self.db.get_unc_short_stays(1, 0.0)), 2)
+
+    async def test_unc_lockout_never_deletes_short_stay_history(self):
+        await self.db.add_unc_short_stay(1, 10, 1.0, 2.0, 0.0)
+        await self.db.add_unc_short_stay(1, 10, 3.0, 4.0, 0.0)
+        await self.db.add_unc_short_stay(2, 10, 1.0, 2.0, 0.0)
+        await self.db.set_unc_lockout(1, 5000.0)
+        await self.db.set_unc_lockout(1, 6000.0)
+        self.assertEqual(len(await self.db.get_unc_short_stays(1, 0.0)), 2)
+        self.assertEqual(len(await self.db.get_unc_short_stays(2, 0.0)), 1)
+
+    async def test_unc_lockout_does_not_touch_unc_count(self):
+        await self.db.increment_unc_count(1)
+        await self.db.increment_unc_count(1)
+        await self.db.set_unc_lockout(1, 5000.0)
+        self.assertEqual(await self.db.get_unc_count(1), 2)
+
     async def test_bot_metadata_and_clear_activity(self):
         # 1. Metadata tests
         self.assertFalse(await self.db.is_initial_sync_done())
