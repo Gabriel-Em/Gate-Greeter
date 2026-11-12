@@ -177,6 +177,11 @@ async def help_command(ctx):
             "active": True,
         },
         {
+            "name": "!channel_separator <bar|dots>",
+            "desc": "Sets ｜ or ┊ between the emoji and channel name (Admin only).",
+            "active": True,
+        },
+        {
             "name": "!revert_channels",
             "desc": "Restores server channel titles back to their original names without emojis (Admin only).",
             "active": True,
@@ -280,6 +285,9 @@ CHANNEL_EMOJI_MAP = {
 }
 
 
+CHANNEL_SEPARATORS = {"bar": "｜", "dots": "┊"}
+
+
 def _match_channel_emoji(channel_name: str):
     """
     Matches a channel name to an entry in CHANNEL_EMOJI_MAP.
@@ -305,6 +313,11 @@ def _match_channel_emoji(channel_name: str):
         # Check previous prefix variants (e.g., emoji-channel or emoji channel)
         if norm_cname == f"{norm_prefix}-{norm_key}" or norm_cname == f"{norm_prefix} {norm_key}":
             return key, target_name, False
+
+        # Check separator variants (e.g., emoji｜channel or emoji┊channel)
+        for sep in CHANNEL_SEPARATORS.values():
+            if norm_cname in (f"{norm_prefix}{sep}{norm_key}", f"{norm_prefix} {sep} {norm_key}"):
+                return key, target_name, False
 
     return None, None, False
 
@@ -403,6 +416,46 @@ async def emojify_channels(ctx, mode: str = None):
         await status_msg.edit(content=None, embed=embed)
     except Exception:
         await ctx.send(embed=embed)
+
+
+@bot.command(name="channel_separator", aliases=["chsep"])
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.bot_has_permissions(administrator=True)
+async def channel_separator(ctx, style: str = None):
+    """
+    Puts a separator between the emoji and the channel name.
+    Usage: !channel_separator bar (｜) | dots (┊)
+    """
+    sep = CHANNEL_SEPARATORS.get((style or "").lower())
+    if not sep:
+        await ctx.send("Usage: `!channel_separator bar` (｜) or `!channel_separator dots` (┊)")
+        return
+
+    changed, skipped, failed = [], 0, []
+    for channel in ctx.guild.channels:
+        if isinstance(channel, discord.CategoryChannel):
+            continue
+        key, target_name, _ = _match_channel_emoji(channel.name)
+        if not key:
+            continue
+        prefix = target_name[:-len(key)].strip()
+        new_name = f"{prefix}{sep}{key}"
+        if channel.name == new_name:
+            skipped += 1
+            continue
+        try:
+            old = channel.name
+            await channel.edit(name=new_name, reason="Channel separator update")
+            changed.append(f"`{old}` ➔ `{new_name}`")
+            await asyncio.sleep(1.0)
+        except Exception as e:
+            failed.append(f"`{channel.name}`: {e}")
+
+    msg = f"✅ Updated {len(changed)}, skipped {skipped}, failed {len(failed)}."
+    if failed:
+        msg += "\n" + "\n".join(failed[:10])
+    await ctx.send(msg[:2000])
 
 
 @bot.command(
