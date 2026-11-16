@@ -3,7 +3,7 @@ import sys
 import unittest
 import tempfile
 import shutil
-import json
+from unittest.mock import patch
 from datetime import datetime, timezone, timedelta
 
 sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")))
@@ -87,6 +87,14 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         all_syncs = await self.db.get_all_channel_syncs()
         self.assertEqual(all_syncs[111], 999001)
         self.assertEqual(all_syncs[222], 999002)
+
+    async def test_channel_watermark_never_moves_backwards(self):
+        await self.db.record_messages_batch({}, {}, {111: (500, "newer")})
+        await self.db.record_messages_batch({}, {}, {111: (400, "older"), 222: (10, "first")})
+        self.assertEqual(await self.db.get_all_channel_syncs(), {111: 500, 222: 10})
+        await self.db.record_messages_batch({}, {}, {111: (500, "same")})
+        await self.db.record_messages_batch({}, {}, {111: (501, "next")})
+        self.assertEqual(await self.db.get_all_channel_syncs(), {111: 501, 222: 10})
 
     async def test_emoji_daily_usage_and_pruning(self):
         now = datetime.now(timezone.utc)
@@ -187,19 +195,6 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         finally:
             await reopened.close()
 
-    async def test_unc_state_table_columns(self):
-        conn = self.db._get_connection()
-        columns = [row["name"] for row in conn.execute("PRAGMA table_info(unc_state);")]
-        self.assertEqual(columns, ["user_id", "last_counted", "locked_until"])
-
-    async def test_unc_short_stays_table_columns(self):
-        conn = self.db._get_connection()
-        columns = [row["name"] for row in conn.execute("PRAGMA table_info(unc_short_stays);")]
-        self.assertIn("user_id", columns)
-        self.assertIn("channel_id", columns)
-        self.assertIn("joined_at", columns)
-        self.assertIn("left_at", columns)
-
     async def test_unc_lockout_preserves_last_counted_and_vice_versa(self):
         await self.db.set_unc_last_counted(1, 50.0)
         await self.db.set_unc_lockout(1, 500.0)
@@ -283,22 +278,95 @@ class TestDatabase(unittest.IsolatedAsyncioTestCase):
         await self.db.set_initial_sync_done(False)
         self.assertFalse(await self.db.is_initial_sync_done())
 
-        # 2. Clear month user activity
+    async def test_default_path_is_resolved_from_environment_at_first_use(self):
+        original_cwd = os.getcwd()
+        os.chdir(self.test_dir)
+        self.addCleanup(os.chdir, original_cwd)
+
+        env_path = os.path.join(self.test_dir, "from_env.db")
+        lazy = Database()
+        with patch.dict(os.environ, {"DATABASE_PATH": env_path}):
+            await lazy.initialize()
+        await lazy.close()
+        self.assertTrue(os.path.exists(env_path))
+
+    async def test_replace_month_user_activity_overwrites_instead_of_adding(self):
         await self.db.record_messages_batch(
-            {(2026, 11, 999, "TempUser"): 50, (2026, 10, 999, "TempUser"): 20},
+            {
+                (2026, 10, 101, "Alice"): 30,
+                (2026, 10, 103, "Carol"): 5,
+                (2026, 11, 101, "Alice"): 7,
+            },
             {},
             {},
         )
-        top11 = await self.db.get_top_users(2026, 11)
-        self.assertEqual(len(top11), 1)
+        self.assertFalse(await self.db.is_month_complete(2026, 10))
 
-        await self.db.clear_month_user_activity(2026, 11)
-        top11_cleared = await self.db.get_top_users(2026, 11)
-        self.assertEqual(len(top11_cleared), 0)
+        for _ in range(2):  # idempotent: a repeated scrape must not accumulate
+            await self.db.replace_month_user_activity(
+                2026, 10, {101: ("Alice Renamed", 40), 102: ("Bob", 15)}, mark_complete=True
+            )
+            self.assertEqual(
+                await self.db.get_top_users(2026, 10),
+                [("Alice Renamed", 40), ("Bob", 15)],
+            )
 
-        # Ensure month 10 remains untouched
-        top10 = await self.db.get_top_users(2026, 10)
-        self.assertEqual(len(top10), 1)
+        self.assertTrue(await self.db.is_month_complete(2026, 10))
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("Alice", 7)])
+        self.assertFalse(await self.db.is_month_complete(2026, 11))
+
+    async def test_replace_month_user_activity_with_no_users_empties_month(self):
+        await self.db.record_messages_batch({(2026, 9, 101, "Alice"): 3}, {}, {})
+        await self.db.replace_month_user_activity(2026, 9, {}, mark_complete=True)
+        self.assertEqual(await self.db.get_top_users(2026, 9), [])
+        self.assertTrue(await self.db.is_month_complete(2026, 9))
+
+    async def test_replace_month_user_activity_can_leave_month_incomplete(self):
+        await self.db.replace_month_user_activity(2026, 9, {101: ("Alice", 3)}, mark_complete=False)
+        self.assertEqual(await self.db.get_top_users(2026, 9), [("Alice", 3)])
+        self.assertFalse(await self.db.is_month_complete(2026, 9))
+
+    async def test_replace_activity_baseline_rebuilds_window_and_keeps_older_data(self):
+        await self.db.record_messages_batch(
+            {(2026, 11, 1, "A"): 10, (2026, 10, 1, "A"): 20},
+            {"2026-10-01 05": 9, "2026-10-12 00": 8, "2026-11-05 10": 4},
+            {5: (100, "2026-11-05T10:00:00+00:00")},
+        )
+        await self.db.record_emoji_batch(
+            {
+                ("2026-10-01", 1, "A", "🔥"): 3,
+                ("2026-10-12", 1, "A", "🔥"): 6,
+                ("2026-11-05", 1, "A", "🔥"): 2,
+            }
+        )
+
+        for _ in range(2):  # idempotent: a repeated baseline must not accumulate
+            await self.db.replace_activity_baseline(
+                year=2026,
+                month=11,
+                user_increments={(2026, 11, 1, "A"): 6},
+                hourly_start="2026-10-12 00",
+                hourly_increments={"2026-11-05 10": 3},
+                emoji_start="2026-10-12",
+                emoji_increments={("2026-11-05", 1, "A", "🔥"): 1},
+                channel_sync_updates={5: (200, "2026-11-06T00:00:00+00:00")},
+            )
+
+            # Rows before the window survive; rows at/after the window start are rebuilt.
+            self.assertEqual(
+                await self.db.get_activity_30_days("2026-01-01 00"),
+                [("2026-10-01 05", 9), ("2026-11-05 10", 3)],
+            )
+            self.assertEqual(
+                await self.db.get_user_top_emojis(1, "2026-01-01"), ([("🔥", 4)], 1, 4)
+            )
+            self.assertEqual(
+                await self.db.get_user_top_emojis(1, "2026-10-12"), ([("🔥", 1)], 1, 1)
+            )
+            # Only the baseline month is rebuilt in the monthly table.
+            self.assertEqual(await self.db.get_top_users(2026, 11), [("A", 6)])
+            self.assertEqual(await self.db.get_top_users(2026, 10), [("A", 20)])
+            self.assertEqual(await self.db.get_all_channel_syncs(), {5: 200})
 
     async def test_get_monthly_totals(self):
         # Insert multi-user message activity across distinct months and years

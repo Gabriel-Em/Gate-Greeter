@@ -5,19 +5,23 @@ import asyncio
 from datetime import datetime, timezone
 from typing import Optional, Dict, List, Tuple, Any
 
-DEFAULT_DB_PATH = os.getenv("DATABASE_PATH", "bot_database.db")
+DEFAULT_DB_PATH = "bot_database.db"
 
 
 class Database:
     """Async thread-safe SQLite database manager for analytics and moderation."""
 
     def __init__(self, db_path: Optional[str] = None):
-        self.db_path = db_path or DEFAULT_DB_PATH
+        # None defers to DATABASE_PATH, read when the connection is first opened
+        # so that values supplied through a .env file are honoured.
+        self.db_path = db_path
         self._lock = asyncio.Lock()
         self._conn: Optional[sqlite3.Connection] = None
 
     def _get_connection(self) -> sqlite3.Connection:
         if self._conn is None:
+            if self.db_path is None:
+                self.db_path = os.getenv("DATABASE_PATH") or DEFAULT_DB_PATH
             self._conn = sqlite3.connect(
                 self.db_path,
                 check_same_thread=False,
@@ -349,43 +353,152 @@ class Database:
     ) -> None:
         conn = self._get_connection()
         with conn:
-            # 1. Update user monthly counts
-            for (year, month, uid, uname), count in user_increments.items():
+            self._apply_message_increments(
+                conn, user_increments, hourly_increments, channel_sync_updates
+            )
+
+    @staticmethod
+    def _apply_message_increments(
+        conn: sqlite3.Connection,
+        user_increments: Dict[Tuple[int, int, int, str], int],
+        hourly_increments: Dict[str, int],
+        channel_sync_updates: Dict[int, Tuple[int, str]],
+    ) -> None:
+        """Adds message counts and moves watermarks inside the caller's transaction."""
+        # 1. Update user monthly counts
+        for (year, month, uid, uname), count in user_increments.items():
+            conn.execute(
+                """
+                INSERT INTO user_monthly_activity (year, month, user_id, user_name, message_count)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(year, month, user_id) DO UPDATE SET
+                    user_name = excluded.user_name,
+                    message_count = user_monthly_activity.message_count + excluded.message_count;
+                """,
+                (year, month, uid, uname, count),
+            )
+
+        # 2. Update hourly activity
+        for date_hour, count in hourly_increments.items():
+            conn.execute(
+                """
+                INSERT INTO activity_hourly (date_hour, message_count)
+                VALUES (?, ?)
+                ON CONFLICT(date_hour) DO UPDATE SET
+                    message_count = activity_hourly.message_count + excluded.message_count;
+                """,
+                (date_hour, count),
+            )
+
+        # 3. Advance channel watermarks (a watermark never moves backwards)
+        for cid, (last_mid, timestamp_str) in channel_sync_updates.items():
+            conn.execute(
+                """
+                INSERT INTO channel_sync (channel_id, last_message_id, last_updated_at)
+                VALUES (?, ?, ?)
+                ON CONFLICT(channel_id) DO UPDATE SET
+                    last_message_id = excluded.last_message_id,
+                    last_updated_at = excluded.last_updated_at
+                WHERE excluded.last_message_id > channel_sync.last_message_id;
+                """,
+                (cid, last_mid, timestamp_str),
+            )
+
+    async def replace_month_user_activity(
+        self,
+        year: int,
+        month: int,
+        user_counts: Dict[int, Tuple[str, int]],
+        mark_complete: bool,
+    ) -> None:
+        """Atomically replaces a month's per-user counts with user_id -> (user_name, count)."""
+        async with self._lock:
+            await asyncio.to_thread(
+                self._sync_replace_month_user_activity, year, month, user_counts, mark_complete
+            )
+
+    def _sync_replace_month_user_activity(
+        self,
+        year: int,
+        month: int,
+        user_counts: Dict[int, Tuple[str, int]],
+        mark_complete: bool,
+    ) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                "DELETE FROM user_monthly_activity WHERE year = ? AND month = ?;",
+                (year, month),
+            )
+            conn.executemany(
+                """
+                INSERT INTO user_monthly_activity (year, month, user_id, user_name, message_count)
+                VALUES (?, ?, ?, ?, ?);
+                """,
+                [(year, month, uid, name, count) for uid, (name, count) in user_counts.items()],
+            )
+            if mark_complete:
                 conn.execute(
                     """
-                    INSERT INTO user_monthly_activity (year, month, user_id, user_name, message_count)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(year, month, user_id) DO UPDATE SET
-                        user_name = excluded.user_name,
-                        message_count = user_monthly_activity.message_count + excluded.message_count;
+                    INSERT INTO month_metadata (year, month, is_complete)
+                    VALUES (?, ?, 1)
+                    ON CONFLICT(year, month) DO UPDATE SET is_complete = 1;
                     """,
-                    (year, month, uid, uname, count),
+                    (year, month),
                 )
 
-            # 2. Update hourly activity
-            for date_hour, count in hourly_increments.items():
-                conn.execute(
-                    """
-                    INSERT INTO activity_hourly (date_hour, message_count)
-                    VALUES (?, ?)
-                    ON CONFLICT(date_hour) DO UPDATE SET
-                        message_count = activity_hourly.message_count + excluded.message_count;
-                    """,
-                    (date_hour, count),
-                )
+    async def replace_activity_baseline(
+        self,
+        year: int,
+        month: int,
+        user_increments: Dict[Tuple[int, int, int, str], int],
+        hourly_start: str,
+        hourly_increments: Dict[str, int],
+        emoji_start: str,
+        emoji_increments: Dict[Tuple[str, int, str, str], int],
+        channel_sync_updates: Dict[int, Tuple[int, str]],
+    ) -> None:
+        """Atomically rebuilds the rolling-window tables and one month of user activity.
 
-            # 3. Update channel watermarks
-            for cid, (last_mid, timestamp_str) in channel_sync_updates.items():
-                conn.execute(
-                    """
-                    INSERT INTO channel_sync (channel_id, last_message_id, last_updated_at)
-                    VALUES (?, ?, ?)
-                    ON CONFLICT(channel_id) DO UPDATE SET
-                        last_message_id = excluded.last_message_id,
-                        last_updated_at = excluded.last_updated_at;
-                    """,
-                    (cid, last_mid, timestamp_str),
-                )
+        Deletes the (year, month) user rows, hourly buckets from `hourly_start` onwards
+        and emoji rows from `emoji_start` onwards, then records the supplied counts.
+        """
+        async with self._lock:
+            await asyncio.to_thread(
+                self._sync_replace_activity_baseline,
+                year,
+                month,
+                user_increments,
+                hourly_start,
+                hourly_increments,
+                emoji_start,
+                emoji_increments,
+                channel_sync_updates,
+            )
+
+    def _sync_replace_activity_baseline(
+        self,
+        year: int,
+        month: int,
+        user_increments: Dict[Tuple[int, int, int, str], int],
+        hourly_start: str,
+        hourly_increments: Dict[str, int],
+        emoji_start: str,
+        emoji_increments: Dict[Tuple[str, int, str, str], int],
+        channel_sync_updates: Dict[int, Tuple[int, str]],
+    ) -> None:
+        conn = self._get_connection()
+        with conn:
+            conn.execute(
+                "DELETE FROM user_monthly_activity WHERE year = ? AND month = ?;",
+                (year, month),
+            )
+            conn.execute("DELETE FROM activity_hourly WHERE date_hour >= ?;", (hourly_start,))
+            conn.execute("DELETE FROM emoji_daily_usage WHERE date >= ?;", (emoji_start,))
+            self._apply_message_increments(
+                conn, user_increments, hourly_increments, channel_sync_updates
+            )
+            self._apply_emoji_increments(conn, emoji_increments)
 
     async def prune_activity_hourly(self, cutoff_date_hour: str) -> int:
         """Deletes hourly activity records older than cutoff_date_hour (e.g. 30 days ago)."""
@@ -544,19 +657,6 @@ class Database:
         cur = conn.execute("SELECT channel_id, last_message_id FROM channel_sync;")
         return {row["channel_id"]: row["last_message_id"] for row in cur.fetchall()}
 
-    async def clear_month_user_activity(self, year: int, month: int) -> None:
-        """Clears user monthly activity for a specific year and month (used before backfilling current month)."""
-        async with self._lock:
-            await asyncio.to_thread(self._sync_clear_month_user_activity, year, month)
-
-    def _sync_clear_month_user_activity(self, year: int, month: int) -> None:
-        conn = self._get_connection()
-        with conn:
-            conn.execute(
-                "DELETE FROM user_monthly_activity WHERE year = ? AND month = ?;",
-                (year, month),
-            )
-
     async def get_metadata(self, key: str) -> Optional[str]:
         """Gets a string value from bot_metadata."""
         async with self._lock:
@@ -611,17 +711,25 @@ class Database:
     ) -> None:
         conn = self._get_connection()
         with conn:
-            for (date_str, uid, uname, emoji), count in emoji_increments.items():
-                conn.execute(
-                    """
-                    INSERT INTO emoji_daily_usage (date, user_id, user_name, emoji, count)
-                    VALUES (?, ?, ?, ?, ?)
-                    ON CONFLICT(date, user_id, emoji) DO UPDATE SET
-                        user_name = excluded.user_name,
-                        count = emoji_daily_usage.count + excluded.count;
-                    """,
-                    (date_str, uid, uname, emoji, count),
-                )
+            self._apply_emoji_increments(conn, emoji_increments)
+
+    @staticmethod
+    def _apply_emoji_increments(
+        conn: sqlite3.Connection,
+        emoji_increments: Dict[Tuple[str, int, str, str], int],
+    ) -> None:
+        """Adds emoji counts inside the caller's transaction."""
+        for (date_str, uid, uname, emoji), count in emoji_increments.items():
+            conn.execute(
+                """
+                INSERT INTO emoji_daily_usage (date, user_id, user_name, emoji, count)
+                VALUES (?, ?, ?, ?, ?)
+                ON CONFLICT(date, user_id, emoji) DO UPDATE SET
+                    user_name = excluded.user_name,
+                    count = emoji_daily_usage.count + excluded.count;
+                """,
+                (date_str, uid, uname, emoji, count),
+            )
 
     async def get_user_top_emojis(
         self, user_id: int, start_date: str, limit: int = 10

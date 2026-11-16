@@ -1,5 +1,6 @@
 import os
 import sys
+import sqlite3
 import unittest
 import tempfile
 import shutil
@@ -507,6 +508,443 @@ class TestMonthlyActivityCommand(unittest.IsolatedAsyncioTestCase):
         files = final_call_kwargs["files"]
         self.assertEqual(len(files), 1)
         self.assertEqual(files[0].filename, "monthly_activity.png")
+
+
+class TestAnalyticsSync(unittest.IsolatedAsyncioTestCase):
+    """History scans (scrape, baseline, catch-up) and buffer persistence must never double count."""
+
+    NOW = datetime(2026, 11, 10, 12, 0, 0, tzinfo=timezone.utc)
+
+    async def asyncSetUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.test_dir, "test_sync.db"))
+        await self.db.initialize()
+
+        self.bot = MagicMock(spec=commands.Bot)
+        self.cog = Analytics(self.bot, db=self.db)
+
+        self.alice = self._user(1001, "alice")
+        self.bob = self._user(1002, "bob")
+        self.robot = self._user(9999, "robot", bot=True)
+
+        self.guild = MagicMock(spec=discord.Guild)
+        self.guild.name = "Test Guild"
+        self.guild.me = MagicMock()
+        self.channel = MagicMock(spec=discord.TextChannel)
+        self.channel.id = 42
+        self.channel.name = "general"
+        self.channel.last_message_id = None
+        self.channel.permissions_for.return_value.read_message_history = True
+        self.guild.text_channels = [self.channel]
+        self.bot.guilds = [self.guild]
+
+        self.messages = []
+        self.channel.history = MagicMock(side_effect=self._history)
+
+        self.ctx = MagicMock()
+        self.ctx.guild = self.guild
+        self.ctx.author = self.alice
+        self.ctx.send = AsyncMock()
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    @staticmethod
+    def _user(uid, name, bot=False):
+        user = MagicMock(spec=discord.Member)
+        user.id = uid
+        user.display_name = name
+        user.mention = f"<@{uid}>"
+        user.bot = bot
+        user.__str__.return_value = name
+        return user
+
+    def _msg(self, author, created_at, content="hello"):
+        msg = MagicMock(spec=discord.Message)
+        msg.id = discord.utils.time_snowflake(created_at) + len(self.messages) + 1
+        msg.author = author
+        msg.content = content
+        msg.created_at = created_at
+        msg.channel = self.channel
+        self.messages.append(msg)
+        return msg
+
+    @staticmethod
+    def _as_snowflake(bound):
+        if bound is None:
+            return None
+        if isinstance(bound, datetime):
+            return discord.utils.time_snowflake(bound)
+        return bound.id
+
+    def _history(self, limit=None, after=None, before=None, oldest_first=None):
+        """Mimics TextChannel.history: exclusive snowflake bounds, oldest first."""
+        low = self._as_snowflake(after)
+        high = self._as_snowflake(before)
+        selected = [
+            m for m in sorted(self.messages, key=lambda m: m.id)
+            if (low is None or m.id > low) and (high is None or m.id < high)
+        ]
+
+        async def iterate():
+            for m in selected:
+                yield m
+
+        return iterate()
+
+    def _frozen_now(self):
+        patcher = patch("cogs.analytics.datetime")
+        mock_dt = patcher.start()
+        self.addCleanup(patcher.stop)
+        mock_dt.now.return_value = self.NOW
+        mock_dt.side_effect = lambda *args, **kwargs: datetime(*args, **kwargs)
+
+    # ---- month bounds -------------------------------------------------------
+
+    def test_month_bounds_are_utc_with_exclusive_end(self):
+        self.assertEqual(
+            Analytics._get_month_bounds(2026, 2),
+            (datetime(2026, 2, 1, tzinfo=timezone.utc), datetime(2026, 3, 1, tzinfo=timezone.utc)),
+        )
+        self.assertEqual(
+            Analytics._get_month_bounds(2026, 12),
+            (datetime(2026, 12, 1, tzinfo=timezone.utc), datetime(2027, 1, 1, tzinfo=timezone.utc)),
+        )
+
+    # ---- monthly scrape -----------------------------------------------------
+
+    async def test_scrape_replaces_live_counts_and_leaves_other_tables_alone(self):
+        self._msg(self.alice, datetime(2020, 9, 30, 23, 59, 59, tzinfo=timezone.utc))
+        self._msg(self.alice, datetime(2020, 10, 1, 0, 0, 0, 1000, tzinfo=timezone.utc))
+        self._msg(self.alice, datetime(2020, 10, 20, 10, 0, 0, tzinfo=timezone.utc))
+        self._msg(self.robot, datetime(2020, 10, 21, 10, 0, 0, tzinfo=timezone.utc))
+        self._msg(self.bob, datetime(2020, 10, 31, 23, 59, 59, 500000, tzinfo=timezone.utc))
+        self._msg(self.bob, datetime(2020, 11, 1, 0, 0, 0, tzinfo=timezone.utc))
+
+        # State left behind by live tracking of the same month.
+        await self.db.record_messages_batch(
+            {(2020, 10, 1001, "alice"): 2},
+            {"2020-10-20 10": 1},
+            {42: (777, "2020-12-01T00:00:00+00:00")},
+        )
+
+        for _ in range(2):
+            await self.cog._scrape_month_data(self.guild, 2020, 10)
+            self.assertEqual(
+                await self.db.get_top_users(2020, 10), [("alice", 2), ("bob", 1)]
+            )
+
+        self.assertTrue(await self.db.is_month_complete(2020, 10))
+        self.assertEqual(await self.db.get_top_users(2020, 9), [])
+        self.assertEqual(await self.db.get_top_users(2020, 11), [])
+        self.assertEqual(
+            await self.db.get_activity_30_days("2020-01-01 00"), [("2020-10-20 10", 1)]
+        )
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: 777})
+
+    # ---- 30-day baseline ----------------------------------------------------
+
+    async def test_baseline_rebuilds_window_without_double_counting(self):
+        self._frozen_now()
+        self._msg(self.alice, datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc), "too old 🔥")
+        self._msg(self.alice, datetime(2026, 10, 20, 9, 0, tzinfo=timezone.utc), "🎉")
+        self._msg(self.bob, datetime(2026, 11, 2, 8, 30, tzinfo=timezone.utc), "yo")
+        self._msg(self.alice, datetime(2026, 11, 2, 8, 45, tzinfo=timezone.utc), "plain")
+        self._msg(self.robot, datetime(2026, 11, 3, 8, 30, tzinfo=timezone.utc), "🤖")
+        latest = self._msg(self.alice, datetime(2026, 11, 9, 10, 15, tzinfo=timezone.utc), "hi 🔥🔥")
+
+        # Stale rows inside the window, plus an older month that must survive.
+        await self.db.record_messages_batch(
+            {(2026, 11, 1001, "alice"): 40, (2026, 10, 1001, "alice"): 50},
+            {"2026-11-09 10": 40},
+            {},
+        )
+        await self.db.record_emoji_batch({("2026-11-09", 1001, "alice", "🔥"): 40})
+        # The newest message is also still pending in the in-memory buffer.
+        await self.cog.on_message(latest)
+
+        for _ in range(2):
+            await self.cog.initial_30d_backfill(self.guild)
+
+            self.assertEqual(
+                await self.db.get_activity_30_days("2026-01-01 00"),
+                [("2026-10-20 09", 1), ("2026-11-02 08", 2), ("2026-11-09 10", 1)],
+            )
+            self.assertEqual(
+                await self.db.get_top_users(2026, 11), [("alice", 2), ("bob", 1)]
+            )
+            self.assertEqual(await self.db.get_top_users(2026, 10), [("alice", 50)])
+            self.assertEqual(
+                await self.db.get_user_top_emojis(1001, "2026-01-01"),
+                ([("🔥", 2), ("🎉", 1)], 2, 3),
+            )
+            self.assertEqual(await self.db.get_all_channel_syncs(), {42: latest.id})
+
+    # ---- catch-up -----------------------------------------------------------
+
+    async def test_catch_up_counts_each_missed_message_once(self):
+        self._frozen_now()
+        seen = self._msg(self.alice, datetime(2026, 11, 8, 10, 0, tzinfo=timezone.utc))
+        self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc), "🔥")
+        self._msg(self.robot, datetime(2026, 11, 9, 10, 30, tzinfo=timezone.utc))
+        pending = self._msg(self.bob, datetime(2026, 11, 9, 11, 0, tzinfo=timezone.utc))
+        await self.db.record_messages_batch(
+            {(2026, 11, 1001, "alice"): 1}, {"2026-11-08 10": 1}, {42: (seen.id, "x")}
+        )
+        # Received over the gateway but not flushed yet when the sync starts.
+        await self.cog.on_message(pending)
+
+        for _ in range(2):
+            await self.cog.catch_up_sync(self.guild)
+            self.assertEqual(
+                await self.db.get_top_users(2026, 11), [("alice", 2), ("bob", 1)]
+            )
+            self.assertEqual(
+                await self.db.get_activity_30_days("2026-01-01 00"),
+                [("2026-11-08 10", 1), ("2026-11-09 10", 1), ("2026-11-09 11", 1)],
+            )
+            self.assertEqual(await self.db.get_all_channel_syncs(), {42: pending.id})
+
+        self.assertEqual(
+            await self.db.get_user_top_emojis(1001, "2026-01-01"), ([("🔥", 1)], 1, 1)
+        )
+
+    async def test_catch_up_seeds_watermark_for_unseen_channel_without_counting(self):
+        self._frozen_now()
+        self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc))
+        self.channel.last_message_id = 555
+
+        await self.cog.catch_up_sync(self.guild)
+
+        self.assertEqual(await self.db.get_top_users(2026, 11), [])
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: 555})
+
+    async def test_flush_waits_for_catch_up_after_a_new_gateway_session(self):
+        """A message received right after connecting must not move the watermark past the downtime gap."""
+        self._frozen_now()
+        await self.db.set_initial_sync_done(True)
+        seen = self._msg(self.alice, datetime(2026, 11, 8, 10, 0, tzinfo=timezone.utc))
+        self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc))  # sent while offline
+        live = self._msg(self.bob, datetime(2026, 11, 9, 11, 0, tzinfo=timezone.utc))
+        await self.db.record_messages_batch(
+            {(2026, 11, 1001, "alice"): 1}, {}, {42: (seen.id, "x")}
+        )
+
+        await self.cog.on_connect()
+        await self.cog.on_message(live)
+        await self.cog.flush_buffer()  # periodic flush firing before on_ready
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: seen.id})
+
+        await self.cog.on_ready()
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("alice", 2), ("bob", 1)])
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: live.id})
+
+        # Normal flushing resumes once the catch-up has run.
+        later = self._msg(self.bob, datetime(2026, 11, 10, 11, 59, tzinfo=timezone.utc))
+        await self.cog.on_message(later)
+        await self.cog.flush_buffer()
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("alice", 2), ("bob", 2)])
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: later.id})
+
+    # ---- on_ready -----------------------------------------------------------
+
+    async def test_on_ready_marks_baseline_done_only_after_success(self):
+        self.cog.initial_30d_backfill = AsyncMock(side_effect=RuntimeError("boom"))
+        await self.cog.on_ready()
+        self.assertFalse(await self.db.is_initial_sync_done())
+
+        self.cog.initial_30d_backfill = AsyncMock()
+        await self.cog.on_ready()
+        self.assertTrue(await self.db.is_initial_sync_done())
+
+    async def test_on_ready_uses_catch_up_once_baseline_exists(self):
+        await self.db.set_initial_sync_done(True)
+        self.cog.initial_30d_backfill = AsyncMock()
+        self.cog.catch_up_sync = AsyncMock()
+        await self.cog.on_ready()
+        self.cog.initial_30d_backfill.assert_not_awaited()
+        self.cog.catch_up_sync.assert_awaited_once_with(self.guild)
+
+    # ---- live buffering -----------------------------------------------------
+
+    async def test_on_message_buffers_and_flush_persists_once(self):
+        msg = self._msg(self.alice, datetime(2026, 11, 9, 10, 15, tzinfo=timezone.utc), "🔥 🔥 🎉")
+        await self.cog.on_message(msg)
+        await self.cog.on_message(self._msg(self.robot, datetime(2026, 11, 9, 10, 16, tzinfo=timezone.utc)))
+
+        await self.cog.flush_buffer()
+        await self.cog.flush_buffer()
+
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("alice", 1)])
+        self.assertEqual(await self.db.get_activity_30_days("2026-01-01 00"), [("2026-11-09 10", 1)])
+        self.assertEqual(
+            await self.db.get_user_top_emojis(1001, "2026-01-01"),
+            ([("🔥", 2), ("🎉", 1)], 2, 3),
+        )
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: msg.id})
+
+    async def test_on_message_ignores_log_channels_and_non_text_channels(self):
+        log_channel = MagicMock(spec=discord.TextChannel)
+        log_channel.name = "Mod-Logs"
+        in_logs = self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc))
+        in_logs.channel = log_channel
+        in_dm = self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc))
+        in_dm.channel = MagicMock(spec=discord.DMChannel)
+
+        await self.cog.on_message(in_logs)
+        await self.cog.on_message(in_dm)
+        await self.cog.flush_buffer()
+
+        self.assertEqual(await self.db.get_top_users(2026, 11), [])
+
+    async def test_only_dash_logs_channels_are_excluded(self):
+        cases = (("blog", True), ("catalogs", True), ("dev-log", True), ("bot-logs", False), ("BOT-LOGS", False))
+        for channel_id, (name, counted) in enumerate(cases, start=100):
+            channel = MagicMock(spec=discord.TextChannel)
+            channel.id = channel_id
+            channel.name = name
+            msg = self._msg(self.alice, datetime(2026, 11, 9, 10, 0, tzinfo=timezone.utc))
+            msg.channel = channel
+            await self.cog.on_message(msg)
+            await self.cog.flush_buffer()
+            with self.subTest(channel=name):
+                self.assertEqual(channel.id in await self.db.get_all_channel_syncs(), counted)
+
+    # ---- !rescrape ----------------------------------------------------------
+
+    async def test_rescrape_replaces_a_finished_month(self):
+        self._frozen_now()
+        self._msg(self.alice, datetime(2026, 10, 3, 9, 0, tzinfo=timezone.utc))
+        self._msg(self.bob, datetime(2026, 10, 4, 9, 0, tzinfo=timezone.utc))
+        self._msg(self.bob, datetime(2026, 10, 5, 9, 0, tzinfo=timezone.utc))
+        # Inflated counts stored for a month already flagged as archived.
+        await self.db.record_messages_batch({(2026, 10, 1001, "alice"): 2, (2026, 10, 1002, "bob"): 4}, {}, {})
+        await self.db.set_month_complete(2026, 10, True)
+        status_msg = AsyncMock()
+        self.ctx.send.return_value = status_msg
+
+        await self.cog.rescrape.callback(self.cog, self.ctx, 2026, 10)
+
+        self.assertEqual(await self.db.get_top_users(2026, 10), [("bob", 2), ("alice", 1)])
+        self.assertTrue(await self.db.is_month_complete(2026, 10))
+        final = status_msg.edit.call_args.kwargs["content"]
+        self.assertIn("2026-10", final)
+        self.assertIn("3 messages", final)
+
+    async def test_rescrape_rejects_unfinished_and_invalid_months(self):
+        self._frozen_now()
+        self.cog._scrape_month_data = AsyncMock()
+        for year, month in ((2026, 11), (2026, 12), (2027, 1), (2026, 0), (2026, 13), (2014, 5)):
+            with self.subTest(year=year, month=month):
+                self.ctx.send.reset_mock()
+                await self.cog.rescrape.callback(self.cog, self.ctx, year, month)
+                self.ctx.send.assert_awaited_once()
+                self.assertTrue(self.ctx.send.call_args.args[0].startswith("⚠️"))
+        self.cog._scrape_month_data.assert_not_awaited()
+
+    async def test_failed_flush_keeps_data_for_the_next_attempt(self):
+        msg = self._msg(self.alice, datetime(2026, 11, 9, 10, 15, tzinfo=timezone.utc), "🔥")
+        await self.cog.on_message(msg)
+
+        real_record = self.db.record_messages_batch
+        self.db.record_messages_batch = AsyncMock(side_effect=sqlite3.OperationalError("database is locked"))
+        with self.assertRaises(sqlite3.OperationalError):
+            await self.cog.flush_buffer()
+        self.assertEqual(await self.db.get_top_users(2026, 11), [])
+
+        self.db.record_messages_batch = real_record
+        await self.cog.flush_buffer()
+        await self.cog.flush_buffer()
+
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("alice", 1)])
+        self.assertEqual(
+            await self.db.get_user_top_emojis(1001, "2026-01-01"), ([("🔥", 1)], 1, 1)
+        )
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: msg.id})
+
+    # ---- commands read the database once the baseline exists ---------------
+
+    async def test_myemojis_reads_database_without_scanning_history(self):
+        self._frozen_now()
+        await self.db.set_initial_sync_done(True)
+        await self.db.record_emoji_batch(
+            {("2026-11-09", 1001, "alice", "🔥"): 3, ("2026-11-09", 1002, "bob", "🚀"): 9}
+        )
+        with patch("cogs.analytics.discord.utils.utcnow", return_value=self.NOW):
+            await self.cog.myemojis.callback(self.cog, self.ctx)
+
+        self.channel.history.assert_not_called()
+        embed = self.ctx.send.call_args_list[-1].kwargs["embed"]
+        self.assertEqual(embed.description, "**1.** 🔥 — **3** uses")
+
+    async def test_myemojis_without_data_does_not_scan_history_after_baseline(self):
+        await self.db.set_initial_sync_done(True)
+        self._msg(self.alice, datetime.now(timezone.utc) - timedelta(days=1), "🔥")
+
+        await self.cog.myemojis.callback(self.cog, self.ctx)
+
+        self.channel.history.assert_not_called()
+        self.assertIn("No emojis found in your messages", self.ctx.send.call_args_list[-1].args[0])
+
+    async def test_emojileaderboard_without_data_does_not_scan_history_after_baseline(self):
+        await self.db.set_initial_sync_done(True)
+        self._msg(self.alice, datetime.now(timezone.utc) - timedelta(days=1), "🔥")
+
+        await self.cog.emojileaderboard.callback(self.cog, self.ctx)
+
+        self.channel.history.assert_not_called()
+        self.assertIn("No emojis found in server messages", self.ctx.send.call_args_list[-1].args[0])
+
+    async def test_activity30_without_data_does_not_scan_history_after_baseline(self):
+        await self.db.set_initial_sync_done(True)
+        self._msg(self.alice, datetime.now(timezone.utc) - timedelta(days=1))
+
+        await self.cog.activity30.callback(self.cog, self.ctx)
+
+        self.channel.history.assert_not_called()
+        self.assertEqual(len(self.ctx.send.call_args_list[-1].kwargs["files"]), 2)
+
+    async def test_activity30_bootstrap_scan_only_fills_hourly_table(self):
+        self._frozen_now()
+        self._msg(self.alice, datetime(2026, 11, 9, 10, 15, tzinfo=timezone.utc))
+        await self.db.record_messages_batch({(2026, 11, 1001, "alice"): 1}, {}, {42: (7, "x")})
+
+        await self.cog.activity30.callback(self.cog, self.ctx)
+
+        self.assertEqual(await self.db.get_activity_30_days("2026-01-01 00"), [("2026-11-09 10", 1)])
+        self.assertEqual(await self.db.get_top_users(2026, 11), [("alice", 1)])
+        self.assertEqual(await self.db.get_all_channel_syncs(), {42: 7})
+
+    # ---- !topusers ----------------------------------------------------------
+
+    async def test_topusers_rejects_years_outside_supported_range(self):
+        self._frozen_now()
+        self.cog._scrape_month_data = AsyncMock()
+        for year in (0, -1, 2014, 2027, 99999):
+            with self.subTest(year=year):
+                self.ctx.send.reset_mock()
+                await self.cog.topusers.callback(self.cog, self.ctx, year)
+                self.ctx.send.assert_awaited_once()
+                self.assertIn("Year must be between 2015 and 2026", self.ctx.send.call_args.args[0])
+        self.cog._scrape_month_data.assert_not_awaited()
+
+    async def test_topusers_scrapes_only_finished_unarchived_months(self):
+        self._frozen_now()
+        await self.db.set_month_complete(2026, 1, True)
+        for month in range(2, 10):
+            await self.db.set_month_complete(2026, month, True)
+        await self.db.record_messages_batch(
+            {(2026, 11, 1001, "alice"): 5, (2026, 3, 1002, "bob"): 9}, {}, {}
+        )
+        self.cog._scrape_month_data = AsyncMock()
+
+        await self.cog.topusers.callback(self.cog, self.ctx, 2026)
+
+        scraped = [call.args[1:3] for call in self.cog._scrape_month_data.await_args_list]
+        self.assertEqual(scraped, [(2026, 10)])
+        embed = self.ctx.send.call_args_list[-1].kwargs["embed"]
+        self.assertEqual(embed.description, "**1.** bob — 9 messages\n**2.** alice — 5 messages")
 
 
 if __name__ == "__main__":

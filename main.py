@@ -142,6 +142,16 @@ async def help_command(ctx):
             "active": analytics_enabled and is_env_enabled("ENABLE_CMD_EMOJILEADERBOARD"),
         },
         {
+            "name": "!syncbaseline",
+            "desc": "Rebuilds the 30-day activity and emoji statistics from message history (Admin only).",
+            "active": analytics_enabled,
+        },
+        {
+            "name": "!rescrape [year] [month]",
+            "desc": "Recounts one finished month from message history, replacing its stored counts (Admin only).",
+            "active": analytics_enabled,
+        },
+        {
             "name": "!prison @user",
             "desc": "Strips a user's roles (except categories), saves them, and sends them to Prison Island.",
             "active": prison_active,

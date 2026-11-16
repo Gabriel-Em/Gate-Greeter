@@ -1,13 +1,11 @@
-import os
 import asyncio
 import random
 import re
-from datetime import datetime
+from datetime import datetime, timezone
 import discord
 from discord.ext import commands
 
 from utils import (
-    ensure_json_file,
     get_env_int,
     get_env_float,
     get_env_int_list,
@@ -17,15 +15,6 @@ from database import db as default_db, Database
 
 # ---------------------------------------------------------
 # MODULE-LEVEL CONSTANTS
-# ---------------------------------------------------------
-PRISON_FILE = "prison_data.json"
-UNC_FILE = "unc_data.json"
-TRUST_FILE = "trust_data.json"
-QUARANTINE_FILE = "quarantine_data.json"
-
-
-# ---------------------------------------------------------
-# PERSISTENT INTERACTIVE COMPONENTS
 # ---------------------------------------------------------
 UNC_MISCLICK_MESSAGES = (
     "👴 {member} walked into `{channel}`, instantly forgot why they were there, and immediately backed out.",
@@ -68,6 +57,14 @@ UNC_VERDICT_AWARD = "AWARD"
 UNC_VERDICT_SILENT = "SILENT"
 UNC_VERDICT_ROAST = "ROAST"
 
+# Largest page Discord returns in one audit-log request. A channel-deletion burst
+# puts many newer entries on top of the one a handler is looking for.
+AUDIT_LOG_LOOKBACK = 100
+
+
+# ---------------------------------------------------------
+# PERSISTENT INTERACTIVE COMPONENTS
+# ---------------------------------------------------------
 class QuarantineReleaseButton(discord.ui.DynamicItem[discord.ui.Button], template=r"quarantine:release:(?P<user_id>[0-9]+)"):
     def __init__(self, user_id: int = 0):
         super().__init__(
@@ -419,7 +416,7 @@ class Moderation(commands.Cog):
             print(f"⚠️ Could not announce unc abuse flag for {member.name}.")
             return
         log_msg = msg.replace(member.mention, member.name)
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
+        print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
 
     # ---------------------------------------------------------
     # VOICE MISCLICK TRACKER (The Unc Dynasty)
@@ -429,7 +426,7 @@ class Moderation(commands.Cog):
         if member.bot or before.channel == after.channel:
             return
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         # Event: Left a channel
         if before.channel is not None:
@@ -516,10 +513,12 @@ class Moderation(commands.Cog):
 
                                 await general_channel.send(msg)
                                 log_msg = msg.replace(member.mention, member.name)
-                                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
+                                print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] {log_msg}")
 
                         except discord.Forbidden:
                             print(f"⚠️ Could not manage unc roles for {member.name}: Bot lacks permissions or hierarchy is incorrect.")
+                        except discord.HTTPException as e:
+                            print(f"⚠️ Could not complete unc award for {member.name}: {e}")
 
                 self.voice_join_times.pop(member.id, None)
 
@@ -538,35 +537,75 @@ class Moderation(commands.Cog):
     # ---------------------------------------------------------
     # PRISON COMMANDS
     # ---------------------------------------------------------
+    def _restricted_roles(self, member: discord.Member, restriction_role: discord.Role | None) -> list[discord.Role]:
+        """Roles a prisoner or quarantined member holds: the restriction role plus what must stay.
+
+        Category dividers stay by design. Discord-managed roles (Server Booster, integration
+        roles) stay because bots cannot remove them; leaving one out makes Discord reject the
+        whole role update.
+        """
+        roles = [role for role in member.roles if role.id in self.category_role_ids or role.managed]
+        if restriction_role and restriction_role not in roles:
+            roles.append(restriction_role)
+        return roles
+
+    def _filter_preservable_role_ids(self, guild_id: int, role_ids) -> list[int]:
+        """Filters out system, category, and restriction role IDs while preserving order."""
+        excluded = {
+            guild_id,
+            self.quarantine_role_id,
+            self.inmate_role_id,
+            *self.category_role_ids,
+        }
+        return list(dict.fromkeys(rid for rid in role_ids if rid not in excluded))
+
     @commands.command(name="prison")
     @commands.has_permissions(manage_roles=True)
     async def prison(self, ctx, member: discord.Member):
-        if os.getenv("ENABLE_CMD_PRISON", "True").lower() not in ("true", "1", "t"):
+        if not is_env_enabled("ENABLE_CMD_PRISON"):
             return
 
         if any(role.id in self.staff_role_ids for role in member.roles):
             return await ctx.send(f"🚫 Cannot imprison staff member {member.mention}.")
 
-        user_id_str = str(member.id)
+        async with self.quarantine_lock:
+            async with self.prison_lock:
+                if await self.db.has_prison_record(member.id):
+                    return await ctx.send(f"⚠️ {member.mention} is already in prison.")
 
-        async with self.prison_lock:
-            if await self.db.has_prison_record(member.id):
-                return await ctx.send(f"⚠️ {member.mention} is already in prison.")
+                deleted_q_entry = await self.db.delete_quarantine_record(member.id)
+                if deleted_q_entry is not None:
+                    q_type = deleted_q_entry.get("type", "account_age") if isinstance(deleted_q_entry, dict) else "account_age"
+                    prior_roles = deleted_q_entry.get("roles", []) if isinstance(deleted_q_entry, dict) else deleted_q_entry
+                    if q_type == "account_age":
+                        roles_to_save = []
+                    else:
+                        roles_to_save = self._filter_preservable_role_ids(ctx.guild.id, prior_roles)
+                else:
+                    roles_to_save = self._filter_preservable_role_ids(
+                        ctx.guild.id,
+                        (role.id for role in member.roles if not role.managed),
+                    )
+                await self.db.set_prison_record(member.id, roles_to_save)
 
-            roles_to_save = [
-                role.id for role in member.roles
-                if role.id != ctx.guild.id and role.id not in self.category_role_ids and not role.managed
-            ]
-            await self.db.set_prison_record(member.id, roles_to_save)
+        new_roles = self._restricted_roles(member, ctx.guild.get_role(self.inmate_role_id))
 
-        new_roles = [role for role in member.roles if role.id in self.category_role_ids]
-        inmate_role = ctx.guild.get_role(self.inmate_role_id)
-        if inmate_role:
-            new_roles.append(inmate_role)
+        try:
+            await member.edit(roles=new_roles, reason="Sent to Rada's Prison Island")
+        except discord.HTTPException as e:
+            # Undo the bookkeeping so the member is not recorded as an inmate they never became.
+            async with self.quarantine_lock:
+                async with self.prison_lock:
+                    await self.db.delete_prison_record(member.id)
+                    if deleted_q_entry is not None:
+                        await self._restore_quarantine_record(member.id, deleted_q_entry)
+            print(f"⚠️ Could not imprison {member.name}: {e}")
+            return await ctx.send(
+                f"❌ Could not imprison {member.mention}: Bot lacks permissions or hierarchy is too low."
+            )
 
-        await member.edit(roles=new_roles, reason="Sent to Rada's Prison Island")
         await ctx.send(f"🔒 {member.mention} has been sent to **Rada’s Prison Island**.")
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🔒 {member.name} has been sent to Rada’s Prison Island.")
+        print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] 🔒 {member.name} has been sent to Rada’s Prison Island.")
 
     async def send_release_dm(
         self,
@@ -604,6 +643,16 @@ class Moderation(commands.Cog):
     # ---------------------------------------------------------
     # QUARANTINE CORE HELPERS
     # ---------------------------------------------------------
+    async def _restore_quarantine_record(self, user_id: int, entry: dict) -> None:
+        """Writes back a quarantine record previously returned by delete_quarantine_record."""
+        await self.db.set_quarantine_record(
+            user_id,
+            entry.get("roles", []),
+            reason=entry.get("reason") or "",
+            q_type=entry.get("type") or "account_age",
+            quarantined_at=entry.get("quarantined_at"),
+        )
+
     async def quarantine_member(
         self,
         member: discord.Member,
@@ -626,8 +675,7 @@ class Moderation(commands.Cog):
             print(f"⚠️ Quarantine role {self.quarantine_role_id} not found in guild {member.guild.name}.")
             return False
 
-        uid = str(member.id)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         async with self.quarantine_lock:
             already_quarantined = any(r.id == self.quarantine_role_id for r in member.roles)
@@ -636,14 +684,20 @@ class Moderation(commands.Cog):
                 print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Ignored quarantine request for {member.name}: already in quarantine.")
                 return False
 
+            # Clear prison data if present to prioritize strict quarantine, preserving any saved roles
+            async with self.prison_lock:
+                deleted_roles = await self.db.delete_prison_record(member.id)
+                if deleted_roles is not None:
+                    print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Cleared prison data for {member.name} to enforce strict quarantine.")
+
             if not in_q_data:
-                roles_to_save = [
-                    role.id for role in member.roles
-                    if role.id != member.guild.id
-                    and role.id not in self.category_role_ids
-                    and not role.managed
-                    and role.id != self.quarantine_role_id
-                ]
+                if deleted_roles is not None:
+                    roles_to_save = self._filter_preservable_role_ids(member.guild.id, deleted_roles)
+                else:
+                    roles_to_save = self._filter_preservable_role_ids(
+                        member.guild.id,
+                        (role.id for role in member.roles if not role.managed),
+                    )
                 effective_type = quarantine_type or ("automod" if is_automod else ("evasion" if is_evasion else "account_age"))
                 await self.db.set_quarantine_record(
                     member.id,
@@ -656,20 +710,19 @@ class Moderation(commands.Cog):
                 record = await self.db.get_quarantine_record(member.id)
                 effective_type = record.get("type", "account_age") if record else "account_age"
 
-        # Clear prison data if present to prioritize strict quarantine
-        async with self.prison_lock:
-            deleted_roles = await self.db.delete_prison_record(member.id)
-            if deleted_roles is not None:
-                print(f"[{now.strftime('%Y-%m-%d %H:%M:%S')}] Cleared prison data for {member.name} to enforce strict quarantine.")
-
-        new_roles = [role for role in member.roles if role.id in self.category_role_ids]
-        if q_role not in new_roles:
-            new_roles.append(q_role)
+        new_roles = self._restricted_roles(member, q_role)
 
         try:
             await member.edit(roles=new_roles, reason=reason)
-        except discord.Forbidden:
-            print(f"⚠️ Could not assign Quarantine role to {member.name}: Bot lacks permissions.")
+        except discord.HTTPException as e:
+            # Undo the bookkeeping so a retry is not rejected as "already in quarantine".
+            async with self.quarantine_lock:
+                async with self.prison_lock:
+                    if not in_q_data:
+                        await self.db.delete_quarantine_record(member.id)
+                    if deleted_roles is not None:
+                        await self.db.set_prison_record(member.id, deleted_roles)
+            print(f"⚠️ Could not assign Quarantine role to {member.name}: {e}")
             return False
 
         quarantine_channel = self.get_quarantine_channel(member.guild)
@@ -677,7 +730,15 @@ class Moderation(commands.Cog):
         view = discord.ui.View(timeout=None)
         view.add_item(QuarantineReleaseButton(member.id))
 
-        if is_automod or effective_type == "automod":
+        if is_evasion or effective_type == "evasion":
+            user_msg = (
+                f"🚨 **Quarantine Evasion Attempted!** {member.mention}, you tried to rejoin the server while quarantined, "
+                f"but Gate Greeter immediately dragged you back to quarantine.\n\n"
+                f"Please wait for staff review."
+            )
+            log_msg = f"🚨 **Quarantine Evasion Detected:** {member.mention} (`{member.name}`) attempted to evade quarantine by rejoining."
+
+        elif is_automod or effective_type == "automod":
             details = automod_details or {}
             rule_name = details.get("rule_name", "AutoMod Rule")
             keyword = details.get("matched_keyword")
@@ -701,14 +762,6 @@ class Moderation(commands.Cog):
                 log_msg += f"\n- **Trigger Keyword:** ||{keyword}||"
             if source_ch:
                 log_msg += f"\n- **Channel:** {source_ch.mention}"
-
-        elif is_evasion or effective_type == "evasion":
-            user_msg = (
-                f"🚨 **Quarantine Evasion Attempted!** {member.mention}, you tried to rejoin the server while quarantined, "
-                f"but Gate Greeter immediately dragged you back to quarantine.\n\n"
-                f"Please wait for staff review."
-            )
-            log_msg = f"🚨 **Quarantine Evasion Detected:** {member.mention} (`{member.name}`) attempted to evade quarantine by rejoining."
 
         elif effective_type == "manual":
             by_str = f" by **{quarantined_by.display_name}**" if quarantined_by else ""
@@ -756,8 +809,7 @@ class Moderation(commands.Cog):
         """Releases a member from quarantine and restores any roles they previously had."""
         q_role = member.guild.get_role(self.quarantine_role_id)
         is_quarantined = (q_role in member.roles) if q_role else False
-        uid = str(member.id)
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         async with self.quarantine_lock:
             saved_entry = await self.db.delete_quarantine_record(member.id)
@@ -777,7 +829,7 @@ class Moderation(commands.Cog):
 
         roles_to_restore = [
             role for role in member.roles
-            if (role.id in self.category_role_ids or role.id == member.guild.id)
+            if (role.id in self.category_role_ids or role.id == member.guild.id or role.managed)
             and role.id != self.quarantine_role_id
         ]
 
@@ -795,7 +847,11 @@ class Moderation(commands.Cog):
 
         try:
             await member.edit(roles=roles_to_restore, reason=f"Released from quarantine into the wild by {released_by.name}")
-        except discord.Forbidden:
+        except discord.HTTPException as e:
+            if saved_entry is not None:
+                async with self.quarantine_lock:
+                    await self._restore_quarantine_record(member.id, saved_entry)
+            print(f"⚠️ Could not release {member.name} from quarantine: {e}")
             return False, f"Could not restore roles for {member.mention}: Bot lacks permissions or hierarchy is too low."
 
         # Send direct message to the released member
@@ -876,7 +932,7 @@ class Moderation(commands.Cog):
 
             roles_to_restore = [ctx.guild.default_role]
             for role in member.roles:
-                if role.id in self.category_role_ids and role.id != self.inmate_role_id:
+                if (role.id in self.category_role_ids or role.managed) and role.id != self.inmate_role_id:
                     roles_to_restore.append(role)
 
             bot_top_role = ctx.guild.me.top_role
@@ -886,9 +942,18 @@ class Moderation(commands.Cog):
                     if role < bot_top_role:
                         roles_to_restore.append(role)
 
-            await member.edit(roles=roles_to_restore, reason="Released from Rada's Prison Island")
+            try:
+                await member.edit(roles=roles_to_restore, reason="Released from Rada's Prison Island")
+            except discord.HTTPException as e:
+                async with self.prison_lock:
+                    await self.db.set_prison_record(member.id, saved_role_ids)
+                print(f"⚠️ Could not release {member.name} from prison: {e}")
+                return await ctx.send(
+                    f"❌ Could not release {member.mention}: Bot lacks permissions or hierarchy is too low."
+                )
+
             await ctx.send(f"✅ {member.mention} has been released from **Rada’s Prison Island**.")
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.name} has been released from Rada’s Prison Island.")
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] ✅ {member.name} has been released from Rada’s Prison Island.")
             return
 
         await ctx.send(f"❌ {member.mention} is neither in prison nor in quarantine.")
@@ -927,7 +992,6 @@ class Moderation(commands.Cog):
 
         account_age = discord.utils.utcnow() - member.created_at
         needs_quarantine = account_age.days <= self.quarantine_days
-        uid = str(member.id)
 
         async with self.quarantine_lock:
             was_quarantined = await self.db.has_quarantine_record(member.id)
@@ -935,16 +999,9 @@ class Moderation(commands.Cog):
         async with self.prison_lock:
             is_inmate = await self.db.has_prison_record(member.id)
 
-        # 1. Auto-Quarantine (Account too new)
-        if needs_quarantine:
-            await self.quarantine_member(
-                member=member,
-                reason=f"Account auto-quarantined. Age: {account_age.days} days.",
-                is_automod=False,
-            )
-
-        # 2. Quarantine Evasion Prevention
-        elif was_quarantined:
+        # 1. Quarantine Evasion Prevention (checked first: an existing record must
+        #    never let a still-new account slip through as "already quarantined")
+        if was_quarantined:
             await self.quarantine_member(
                 member=member,
                 reason="Quarantine evasion attempted. Re-quarantined upon rejoining.",
@@ -952,12 +1009,17 @@ class Moderation(commands.Cog):
                 is_evasion=True,
             )
 
+        # 2. Auto-Quarantine (Account too new)
+        elif needs_quarantine:
+            await self.quarantine_member(
+                member=member,
+                reason=f"Account auto-quarantined. Age: {account_age.days} days.",
+                is_automod=False,
+            )
+
         # 3. Standard Prison Lockdown
         elif is_inmate:
-            new_roles = [role for role in member.roles if role.id in self.category_role_ids]
-            inmate_role = member.guild.get_role(self.inmate_role_id)
-            if inmate_role:
-                new_roles.append(inmate_role)
+            new_roles = self._restricted_roles(member, member.guild.get_role(self.inmate_role_id))
 
             try:
                 await member.edit(roles=new_roles, reason="Fleeing inmate rejoined. Sent back to prison.")
@@ -995,7 +1057,7 @@ class Moderation(commands.Cog):
     # ---------------------------------------------------------
     @commands.Cog.listener()
     async def on_automod_action(self, execution: discord.AutoModAction):
-        print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] ⚡ AutoMod event received! Guild ID: {execution.guild_id}, User ID: {execution.user_id}, Rule ID: {execution.rule_id}, Channel ID: {execution.channel_id}")
+        print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] ⚡ AutoMod event received! Guild ID: {execution.guild_id}, User ID: {execution.user_id}, Rule ID: {execution.rule_id}, Channel ID: {execution.channel_id}")
 
         guild = self.bot.get_guild(execution.guild_id) or execution.guild
         if not guild:
@@ -1005,7 +1067,7 @@ class Moderation(commands.Cog):
         quarantine_channel = self.get_quarantine_channel(guild)
         # 1. Do not re-quarantine if violation occurred inside quarantine channel
         if quarantine_channel and execution.channel_id == quarantine_channel.id:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored violation inside quarantine channel for user ID {execution.user_id}.")
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored violation inside quarantine channel for user ID {execution.user_id}.")
             return
 
         user_id = execution.user_id
@@ -1028,17 +1090,17 @@ class Moderation(commands.Cog):
 
         # 3. Skip staff members
         if any(role.id in self.staff_role_ids for role in member.roles):
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored staff member {member.name}.")
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored staff member {member.name}.")
             return
 
         # 4. Skip members already having the quarantine role
         if any(role.id == self.quarantine_role_id for role in member.roles):
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored {member.name} (already has Quarantine role).")
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored {member.name} (already has Quarantine role).")
             return
 
         # 5. Check if the member joined less than self.quarantine_new_member_days ago (default: 7 days)
         if not member.joined_at:
-            print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Could not resolve join date for {member.name}.")
+            print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Could not resolve join date for {member.name}.")
             return
 
         join_duration = discord.utils.utcnow() - member.joined_at
@@ -1047,7 +1109,7 @@ class Moderation(commands.Cog):
 
         if joined_days >= self.quarantine_new_member_days:
             print(
-                f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored {member.name} - "
+                f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] AutoMod: Ignored {member.name} - "
                 f"server membership is {joined_days:.1f} days (threshold: {self.quarantine_new_member_days} days)."
             )
             return
@@ -1068,7 +1130,7 @@ class Moderation(commands.Cog):
         }
 
         print(
-            f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] 🚨 AutoMod violation ({rule_name}) "
+            f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] 🚨 AutoMod violation ({rule_name}) "
             f"by new member {member.name} (joined {joined_days:.1f}d ago). Quarantining..."
         )
         await self.quarantine_member(
@@ -1088,6 +1150,16 @@ class Moderation(commands.Cog):
 
         had_q = any(r.id == self.quarantine_role_id for r in before.roles)
         has_q = any(r.id == self.quarantine_role_id for r in after.roles)
+        is_inmate = any(r.id == self.inmate_role_id for r in after.roles)
+
+        # Free any pending trust_records row if the Trusted Media role was granted (e.g. manually in UI)
+        if not after.bot and self.trusted_role_id and not has_q and not is_inmate:
+            had_trusted = any(r.id == self.trusted_role_id for r in before.roles)
+            has_trusted = any(r.id == self.trusted_role_id for r in after.roles)
+            if not had_trusted and has_trusted:
+                async with self.trust_lock:
+                    await self.db.delete_trust_record(after.id)
+                self.trust_cooldowns.pop(after.id, None)
 
         # 1. Staff manually unquarantined the user by removing the role in Discord UI
         if had_q and not has_q:
@@ -1106,7 +1178,7 @@ class Moderation(commands.Cog):
                         if roles_to_add:
                             try:
                                 await after.add_roles(*roles_to_add, reason="Quarantine role manually removed: Restored prior roles.")
-                                print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Restored prior roles for {after.name} on manual quarantine release.")
+                                print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Restored prior roles for {after.name} on manual quarantine release.")
                             except discord.Forbidden:
                                 pass
 
@@ -1122,37 +1194,32 @@ class Moderation(commands.Cog):
             return
 
         is_quarantined = has_q
-        is_inmate = any(r.id == self.inmate_role_id for r in after.roles)
 
         if not is_quarantined and not is_inmate:
             return
 
         # 2. Enforce Quarantine (ONLY Quarantine + Category Roles)
         if is_quarantined:
-            q_role = after.guild.get_role(self.quarantine_role_id)
-            valid_roles = [q_role] if q_role else []
-            valid_roles.extend(r for r in after.roles if r.id in self.category_role_ids)
+            valid_roles = self._restricted_roles(after, after.guild.get_role(self.quarantine_role_id))
 
             current_roles = [r for r in after.roles if r.id != after.guild.default_role.id]
             if set(r.id for r in current_roles) != set(r.id for r in valid_roles):
                 try:
                     await after.edit(roles=valid_roles, reason="Strict Quarantine Enforcement: Prevented role self-assignment.")
-                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from quarantined user {after.name}.")
+                    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from quarantined user {after.name}.")
                 except discord.Forbidden:
                     pass
             return
 
         # 3. Enforce Prison (ONLY Inmate + Category Roles)
         if is_inmate:
-            inmate_role = after.guild.get_role(self.inmate_role_id)
-            valid_roles = [inmate_role] if inmate_role else []
-            valid_roles.extend(r for r in after.roles if r.id in self.category_role_ids)
+            valid_roles = self._restricted_roles(after, after.guild.get_role(self.inmate_role_id))
 
             current_roles = [r for r in after.roles if r.id != after.guild.default_role.id]
             if set(r.id for r in current_roles) != set(r.id for r in valid_roles):
                 try:
                     await after.edit(roles=valid_roles, reason="Strict Prison Enforcement: Prevented role self-assignment.")
-                    print(f"[{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from imprisoned user {after.name}.")
+                    print(f"[{datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}] Stripped unauthorized onboarding roles from imprisoned user {after.name}.")
                 except discord.Forbidden:
                     pass
 
@@ -1162,6 +1229,9 @@ class Moderation(commands.Cog):
     @commands.Cog.listener()
     async def on_message(self, message):
         if message.author.bot or not message.guild:
+            return
+        # Roles are only known for members (not for users who left or webhook authors)
+        if not isinstance(message.author, discord.Member):
             return
 
         # 1. Ignore users who already have Trusted Media, OR are currently in Prison / Quarantine
@@ -1174,7 +1244,7 @@ class Moderation(commands.Cog):
             return
 
         # 2. Check the anti-spam cooldown buffer
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
         last_interaction = self.trust_cooldowns.get(message.author.id)
 
         if last_interaction and (now - last_interaction).total_seconds() < self.trust_cooldown_seconds:
@@ -1221,16 +1291,22 @@ class Moderation(commands.Cog):
         await asyncio.sleep(2)
 
         deleter = None
-        async for entry in guild.audit_logs(limit=1, action=discord.AuditLogAction.channel_delete):
-            if entry.target.id == channel.id:
-                deleter = entry.user
-                break
+        try:
+            async for entry in guild.audit_logs(
+                limit=AUDIT_LOG_LOOKBACK, action=discord.AuditLogAction.channel_delete
+            ):
+                if entry.target.id == channel.id:
+                    deleter = entry.user
+                    break
+        except discord.HTTPException as e:
+            print(f"⚠️ Anti-nuke could not read the audit log in {guild.name}: {e}")
+            return
 
         if not deleter:
             return
 
         user_id = deleter.id
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
 
         if user_id not in self.channel_deletions:
             self.channel_deletions[user_id] = []
@@ -1265,7 +1341,8 @@ class Moderation(commands.Cog):
                             await mods_chat.send(f"⚠️ **URGENT:** The bot {member.mention} is deleting channels, but my role is too low to kick it!")
                 else:
                     try:
-                        await member.edit(roles=[], reason=f"Anti-Nuke: Deleted {self.anti_nuke_limit} channels within {self.anti_nuke_window // 60} minutes.")
+                        # Managed roles cannot be removed by bots; asking to would fail the whole lockdown.
+                        await member.edit(roles=[r for r in member.roles if r.managed], reason=f"Anti-Nuke: Deleted {self.anti_nuke_limit} channels within {self.anti_nuke_window // 60} minutes.")
                         if mods_chat:
                             await mods_chat.send(
                                 f"🚨 **ANTI-NUKE LOCKDOWN TRIGGERED!** 🚨\n"

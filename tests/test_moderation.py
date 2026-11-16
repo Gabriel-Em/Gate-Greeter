@@ -1,5 +1,8 @@
 import os
+import random
+import shutil
 import sys
+import tempfile
 import unittest
 from unittest.mock import AsyncMock, MagicMock, patch
 from datetime import datetime, timedelta, timezone
@@ -9,22 +12,14 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), "..")
 
 import discord
 from discord.ext import commands
-from cogs.moderation import Moderation, QuarantineReleaseButton, QUARANTINE_FILE, PRISON_FILE
+from cogs.moderation import Moderation, QuarantineReleaseButton
 from database import Database
-from utils import load_json_data, save_json_data
 
 
 class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
     async def asyncSetUp(self):
-        # Use temporary file paths for tests
-        self.test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "tmp"))
-        os.makedirs(self.test_dir, exist_ok=True)
-        self.orig_q_file = QUARANTINE_FILE
-        self.orig_p_file = PRISON_FILE
-
+        self.test_dir = tempfile.mkdtemp()
         self.test_db_file = os.path.join(self.test_dir, "test_moderation.db")
-        if os.path.exists(self.test_db_file):
-            os.remove(self.test_db_file)
         self.test_db = Database(self.test_db_file)
 
         # Mock Bot
@@ -51,15 +46,17 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         self.guild.fetch_member = AsyncMock(side_effect=lambda uid: self.guild.get_member(uid))
         self.bot.get_guild.return_value = self.guild
 
-        self.default_role = MagicMock(spec=discord.Role, id=1000, name="@everyone")
+        self.default_role = MagicMock(spec=discord.Role, id=1000, name="@everyone", managed=False)
         self.guild.default_role = self.default_role
 
-        self.q_role = MagicMock(spec=discord.Role, id=999, name="Quarantine")
-        self.category_role = MagicMock(spec=discord.Role, id=500, name="Category")
+        self.q_role = MagicMock(spec=discord.Role, id=999, name="Quarantine", managed=False)
+        self.category_role = MagicMock(spec=discord.Role, id=500, name="Category", managed=False)
+        # Managed by Discord (e.g. Server Booster): bots can neither add nor remove it.
+        self.booster_role = MagicMock(spec=discord.Role, id=650, name="Server Booster", managed=True)
         self.user_role1 = MagicMock(spec=discord.Role, id=601, name="Role1", managed=False)
         self.user_role2 = MagicMock(spec=discord.Role, id=602, name="Role2", managed=False)
-        self.staff_role = MagicMock(spec=discord.Role, id=700, name="Moderator")
-        self.bot_top_role = MagicMock(spec=discord.Role, id=9999, name="Bot Top")
+        self.staff_role = MagicMock(spec=discord.Role, id=700, name="Moderator", managed=False)
+        self.bot_top_role = MagicMock(spec=discord.Role, id=9999, name="Bot Top", managed=True)
 
         # Top role comparison setup
         self.bot_top_role.__gt__ = lambda self, other: True
@@ -79,6 +76,7 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
                 601: self.user_role1,
                 602: self.user_role2,
                 700: self.staff_role,
+                650: self.booster_role,
             }
             return mapping.get(rid)
 
@@ -102,14 +100,7 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
 
     async def asyncTearDown(self):
         await self.test_db.close()
-        for f in [self.test_db_file, self.test_db_file + "-wal", self.test_db_file + "-shm"]:
-            if os.path.exists(f):
-                os.remove(f)
-        if os.path.exists(self.test_dir):
-            try:
-                os.rmdir(self.test_dir)
-            except OSError:
-                pass
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def _create_member(self, user_id=12345, name="Newbie", created_days_ago=10, joined_days_ago=2, roles=None):
         member = MagicMock(spec=discord.Member)
@@ -589,6 +580,274 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
         sent_content = self.quarantine_channel.send.call_args.args[0]
         self.assertIn("Quarantine Evasion Attempted", sent_content)
 
+    async def test_quarantine_evasion_on_rejoin_with_account_still_too_new(self):
+        """A quarantined new account that rejoins is dragged back instead of being skipped as 'already quarantined'."""
+        member = self._create_member(created_days_ago=2, joined_days_ago=0)
+        await self.cog.db.set_quarantine_record(
+            member.id, roles=[], reason="Account too new", q_type="account_age"
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        member.edit.assert_awaited_once()
+        self.assertIn(self.q_role, member.edit.call_args.kwargs["roles"])
+        self.assertIn("Quarantine Evasion Attempted", self.quarantine_channel.send.call_args.args[0])
+        self.assertTrue(await self.cog.db.has_quarantine_record(member.id))
+
+    async def test_quarantine_evasion_on_rejoin_keeps_evasion_wording_for_automod_record(self):
+        """Rejoining while quarantined by AutoMod is announced as evasion and keeps the saved roles."""
+        member = self._create_member(created_days_ago=50, joined_days_ago=0)
+        await self.cog.db.set_quarantine_record(
+            member.id, roles=[self.user_role1.id], reason="AutoMod", q_type="automod"
+        )
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        user_msg = self.quarantine_channel.send.call_args.args[0]
+        self.assertIn("Quarantine Evasion Attempted", user_msg)
+        self.assertNotIn("flagged by AutoMod", user_msg)
+        self.assertIn("Quarantine Evasion Detected", self.quarantine_logs_channel.send.call_args.args[0])
+        record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertEqual((record["type"], record["roles"]), ("automod", [self.user_role1.id]))
+
+    def _forbidden(self):
+        return discord.Forbidden(MagicMock(status=403, reason="Forbidden"), "Missing Permissions")
+
+    async def test_failed_quarantine_leaves_no_record_behind(self):
+        """If Discord rejects the role change, the member is not recorded as quarantined and can be retried."""
+        member = self._create_member(roles=[self.default_role, self.user_role1])
+        member.edit.side_effect = self._forbidden()
+
+        self.assertFalse(await self.cog.quarantine_member(member, reason="x", quarantine_type="manual"))
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
+        self.quarantine_channel.send.assert_not_awaited()
+
+        member.edit.side_effect = None
+        self.assertTrue(await self.cog.quarantine_member(member, reason="x", quarantine_type="manual"))
+        record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertEqual(record["roles"], [self.user_role1.id])
+
+    async def test_failed_quarantine_of_inmate_restores_prison_record(self):
+        member = self._create_member(roles=[self.default_role])
+        await self.cog.db.set_prison_record(member.id, [self.user_role1.id, self.user_role2.id])
+        member.edit.side_effect = self._forbidden()
+
+        self.assertFalse(await self.cog.quarantine_member(member, reason="x", quarantine_type="manual"))
+
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
+        self.assertEqual(
+            await self.cog.db.get_prison_record(member.id), [self.user_role1.id, self.user_role2.id]
+        )
+
+    async def test_failed_evasion_requarantine_keeps_existing_record(self):
+        member = self._create_member(created_days_ago=50, joined_days_ago=0)
+        await self.cog.db.set_quarantine_record(
+            member.id, roles=[self.user_role1.id], reason="AutoMod", q_type="automod"
+        )
+        member.edit.side_effect = self._forbidden()
+
+        self.assertFalse(await self.cog.quarantine_member(member, reason="x", is_evasion=True))
+
+        record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertEqual((record["type"], record["roles"]), ("automod", [self.user_role1.id]))
+
+    async def test_failed_quarantine_release_keeps_saved_roles(self):
+        """A release Discord rejects must not throw away the roles saved for restoration."""
+        member = self._create_member(roles=[self.default_role, self.q_role])
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id],
+            reason="Spam",
+            q_type="manual",
+            quarantined_at="2026-01-02T03:04:05+00:00",
+        )
+        member.edit.side_effect = self._forbidden()
+
+        success, _ = await self.cog.release_quarantined_member(member, released_by=staff)
+
+        self.assertFalse(success)
+        member.send.assert_not_awaited()
+        self.assertEqual(
+            await self.cog.db.get_quarantine_record(member.id),
+            {
+                "roles": [self.user_role1.id],
+                "quarantined_at": "2026-01-02T03:04:05+00:00",
+                "reason": "Spam",
+                "type": "manual",
+            },
+        )
+
+    async def test_failed_prison_release_keeps_saved_roles(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        member = self._create_member(roles=[self.default_role, inmate_role])
+        await self.cog.db.set_prison_record(member.id, [self.user_role1.id])
+        member.edit.side_effect = self._forbidden()
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertEqual(await self.cog.db.get_prison_record(member.id), [self.user_role1.id])
+        self.assertIn("Could not release", ctx.send.call_args.args[0])
+
+    async def test_failed_imprisonment_rolls_back_records(self):
+        """If Discord rejects the role change, no prison record remains and a prior quarantine record is kept."""
+        self._setup_prison_quarantine_roles()
+        member = self._create_member(roles=[self.default_role, self.q_role])
+        await self.cog.db.set_quarantine_record(
+            member.id, roles=[self.user_role1.id], reason="Spam", q_type="manual"
+        )
+        member.edit.side_effect = self._forbidden()
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+
+        self.assertFalse(await self.cog.db.has_prison_record(member.id))
+        record = await self.cog.db.get_quarantine_record(member.id)
+        self.assertEqual((record["type"], record["roles"]), ("manual", [self.user_role1.id]))
+        self.assertIn("Could not imprison", ctx.send.call_args.args[0])
+
+    async def test_prison_release_restores_saved_roles(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        member = self._create_member(roles=[self.default_role, self.category_role, inmate_role])
+        await self.cog.db.set_prison_record(member.id, [self.user_role1.id, self.user_role2.id])
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertEqual(
+            {r.id for r in member.edit.call_args.kwargs["roles"]},
+            {self.default_role.id, self.category_role.id, self.user_role1.id, self.user_role2.id},
+        )
+        self.assertFalse(await self.cog.db.has_prison_record(member.id))
+
+    async def test_release_of_member_who_is_not_restricted_changes_nothing(self):
+        member = self._create_member(roles=[self.default_role, self.user_role1])
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        member.edit.assert_not_awaited()
+        self.assertIn("neither in prison nor in quarantine", ctx.send.call_args.args[0])
+
+    async def test_staff_cannot_be_quarantined_or_imprisoned(self):
+        member = self._create_member(roles=[self.default_role, self.staff_role])
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="x")
+
+        member.edit.assert_not_awaited()
+        self.assertFalse(await self.cog.db.has_prison_record(member.id))
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
+
+    # ---- managed roles (Server Booster, integrations) ----------------------
+
+    async def test_quarantine_keeps_managed_roles_and_does_not_save_them(self):
+        member = self._create_member(
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role, self.booster_role, self.user_role1],
+        )
+
+        self.assertTrue(await self.cog.quarantine_member(member, reason="x", quarantine_type="manual"))
+
+        self.assertEqual(
+            {r.id for r in member.edit.call_args.kwargs["roles"]},
+            {self.category_role.id, self.booster_role.id, self.q_role.id},
+        )
+        self.assertEqual((await self.cog.db.get_quarantine_record(member.id))["roles"], [self.user_role1.id])
+
+    async def test_prison_keeps_managed_roles_and_does_not_save_them(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            roles=[self.default_role, self.category_role, self.booster_role, self.user_role1]
+        )
+        ctx = self._make_staff_ctx(self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role]))
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+
+        self.assertEqual(
+            {r.id for r in member.edit.call_args.kwargs["roles"]},
+            {self.category_role.id, self.booster_role.id, inmate_role.id},
+        )
+        self.assertEqual(await self.cog.db.get_prison_record(member.id), [self.user_role1.id])
+
+    async def test_releases_keep_managed_roles(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+
+        quarantined = self._create_member(user_id=1, roles=[self.default_role, self.booster_role, self.q_role])
+        await self.cog.db.set_quarantine_record(1, roles=[self.user_role1.id], reason="x", q_type="manual")
+        success, _ = await self.cog.release_quarantined_member(quarantined, released_by=staff)
+        self.assertTrue(success)
+        self.assertEqual(
+            {r.id for r in quarantined.edit.call_args.kwargs["roles"]},
+            {self.default_role.id, self.booster_role.id, self.user_role1.id},
+        )
+
+        inmate = self._create_member(user_id=2, roles=[self.default_role, self.booster_role, inmate_role])
+        await self.cog.db.set_prison_record(2, [self.user_role2.id])
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.release.callback(self.cog, self._make_staff_ctx(staff), inmate)
+        self.assertEqual(
+            {r.id for r in inmate.edit.call_args.kwargs["roles"]},
+            {self.default_role.id, self.booster_role.id, self.user_role2.id},
+        )
+
+    async def test_enforcement_tolerates_managed_roles_but_still_strips_others(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        for restriction in (self.q_role, inmate_role):
+            with self.subTest(restriction=restriction.id):
+                allowed = [self.default_role, self.category_role, self.booster_role, restriction]
+                before = self._create_member(roles=[self.default_role, restriction])
+                settled = self._create_member(roles=allowed)
+                await self.cog.on_member_update(before, settled)
+                settled.edit.assert_not_awaited()
+
+                sneaky = self._create_member(roles=[*allowed, self.user_role1])
+                await self.cog.on_member_update(settled, sneaky)
+                sneaky.edit.assert_awaited_once()
+                self.assertEqual(
+                    {r.id for r in sneaky.edit.call_args.kwargs["roles"]},
+                    {self.category_role.id, self.booster_role.id, restriction.id},
+                )
+
+    async def test_fleeing_inmate_is_locked_down_again_on_rejoin(self):
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            created_days_ago=300, joined_days_ago=0, roles=[self.default_role, self.booster_role, self.user_role1]
+        )
+        await self.cog.db.set_prison_record(member.id, [self.user_role2.id])
+
+        with patch("asyncio.sleep", new_callable=AsyncMock):
+            self.guild.get_member.return_value = member
+            await self.cog.on_member_join(member)
+
+        self.assertEqual(
+            {r.id for r in member.edit.call_args.kwargs["roles"]}, {self.booster_role.id, inmate_role.id}
+        )
+        self.assertEqual(await self.cog.db.get_prison_record(member.id), [self.user_role2.id])
+
+    async def test_quarantine_timestamp_is_stored_in_utc(self):
+        member = self._create_member(created_days_ago=300, roles=[self.default_role])
+        before = datetime.now(timezone.utc)
+        await self.cog.quarantine_member(member, reason="x", quarantine_type="manual")
+        after = datetime.now(timezone.utc)
+
+        stored = datetime.fromisoformat((await self.cog.db.get_quarantine_record(member.id))["quarantined_at"])
+        self.assertEqual(stored.utcoffset(), timedelta(0))
+        self.assertTrue(before <= stored <= after)
+
     async def test_on_ready_audit_runs_successfully(self):
         """on_ready performs comprehensive permission, channel, and role audits without crashing."""
         self.bot.guilds = [self.guild]
@@ -684,20 +943,249 @@ class TestQuarantineAndModeration(unittest.IsolatedAsyncioTestCase):
 
         mock_print.assert_any_call("⚠️ Newcomers channel 999999 not found in guild CosmicSkeptic's community. Welcome greeting not sent.")
 
+    def _setup_prison_quarantine_roles(self):
+        """Configures inmate, trusted, and 5 user roles on the mock guild for transition tests."""
+        self.q_role.managed = False
+        inmate_role = MagicMock(spec=discord.Role, id=888, name="Inmate", managed=False)
+        trusted_role = MagicMock(spec=discord.Role, id=605, name="Trusted Media", managed=False)
+        extra_roles = [
+            MagicMock(spec=discord.Role, id=603, name="Role3", managed=False),
+            MagicMock(spec=discord.Role, id=604, name="Role4", managed=False),
+            trusted_role,
+        ]
+        for r in [inmate_role, *extra_roles]:
+            r.__lt__ = lambda self, other: True
 
-if __name__ == "__main__":
-    unittest.main()
+        self.cog.trusted_role_id = trusted_role.id
+        five_roles = [self.user_role1, self.user_role2, *extra_roles]
+        all_roles = {
+            1000: self.default_role,
+            999: self.q_role,
+            888: inmate_role,
+            500: self.category_role,
+            700: self.staff_role,
+            650: self.booster_role,
+            **{r.id: r for r in five_roles},
+        }
+        self.guild.get_role.side_effect = all_roles.get
+        return inmate_role, trusted_role, five_roles
+
+    async def _attach_live_role_edit(self, member):
+        """Simulates Discord updating member.roles and dispatching on_member_update on member.edit."""
+        async def live_edit(*, roles, reason=None):
+            before = self._create_member(
+                user_id=member.id,
+                name=member.name,
+                roles=list(member.roles),
+            )
+            new_roles = [self.default_role]
+            for r in roles:
+                if r not in new_roles:
+                    new_roles.append(r)
+            member.roles = new_roles
+            after = self._create_member(
+                user_id=member.id,
+                name=member.name,
+                roles=list(member.roles),
+            )
+            await self.cog.on_member_update(before, after)
+
+        member.edit = AsyncMock(side_effect=live_edit)
+
+    def _make_staff_ctx(self, staff):
+        ctx = MagicMock()
+        ctx.author = staff
+        ctx.guild = self.guild
+        ctx.channel = self.quarantine_channel
+        ctx.send = AsyncMock()
+        return ctx
+
+    async def test_prison_quarantine_cycle_ending_in_quarantine_restores_all_roles(self):
+        """prison -> quarantine -> prison -> quarantine -> prison -> quarantine -> release restores all 5 roles cleanly."""
+        inmate_role, _, five_roles = self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            user_id=12345,
+            name="CycleUser",
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role, *five_roles],
+        )
+        await self._attach_live_role_edit(member)
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx = self._make_staff_ctx(staff)
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            # 1. prison -> 2. quarantine -> 3. prison -> 4. quarantine -> 5. prison -> 6. quarantine
+            await self.cog.prison.callback(self.cog, ctx, member)
+            self.assertIn(inmate_role, member.roles)
+
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Q1")
+            self.assertIn(self.q_role, member.roles)
+            self.assertIsNone(await self.cog.db.get_prison_record(member.id))
+
+            await self.cog.prison.callback(self.cog, ctx, member)
+            self.assertIn(inmate_role, member.roles)
+            self.assertIsNone(await self.cog.db.get_quarantine_record(member.id))
+
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Q2")
+            self.assertIn(self.q_role, member.roles)
+            self.assertIsNone(await self.cog.db.get_prison_record(member.id))
+
+            await self.cog.prison.callback(self.cog, ctx, member)
+            self.assertIn(inmate_role, member.roles)
+            self.assertIsNone(await self.cog.db.get_quarantine_record(member.id))
+
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Q3")
+            self.assertIn(self.q_role, member.roles)
+
+            # Intermediate Quarantine -> Prison transitions must NOT send bogus quarantine release DMs/logs
+            member.send.assert_not_awaited()
+            for call in self.quarantine_logs_channel.send.call_args_list:
+                self.assertNotIn("Quarantine Release", call.args[0])
+
+            # 7. Release from quarantine into the wild
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertEqual(
+            {r.id for r in member.roles},
+            {self.default_role.id, self.category_role.id, *(r.id for r in five_roles)},
+        )
+        self.assertFalse(await self.cog.db.has_prison_record(member.id))
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
+
+    async def test_prison_quarantine_cycle_ending_in_prison_restores_all_roles(self):
+        """prison -> quarantine -> prison -> release restores all 5 roles directly without bouncing back to quarantine."""
+        inmate_role, _, five_roles = self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            user_id=12345,
+            name="CycleUser",
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role, *five_roles],
+        )
+        await self._attach_live_role_edit(member)
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx = self._make_staff_ctx(staff)
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Q1")
+            await self.cog.prison.callback(self.cog, ctx, member)
+            self.assertIn(inmate_role, member.roles)
+
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertNotIn(self.q_role, member.roles)
+        self.assertNotIn(inmate_role, member.roles)
+        self.assertEqual(
+            {r.id for r in member.roles},
+            {self.default_role.id, self.category_role.id, *(r.id for r in five_roles)},
+        )
+        self.assertFalse(await self.cog.db.has_prison_record(member.id))
+        self.assertFalse(await self.cog.db.has_quarantine_record(member.id))
+
+    async def test_prison_from_empty_quarantine_and_quarantine_from_empty_prison_preserve_empty_list(self):
+        """Zero prior roles stays [] across prison <-> quarantine without saving restriction roles."""
+        inmate_role, _, _ = self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            user_id=22222,
+            name="NoRolesUser",
+            created_days_ago=300,
+            roles=[self.default_role, self.category_role],
+        )
+        await self._attach_live_role_edit(member)
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx = self._make_staff_ctx(staff)
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+            await self.cog.manual_quarantine.callback(self.cog, ctx, member, reason="Q1")
+            q_rec = await self.cog.db.get_quarantine_record(member.id)
+            self.assertEqual(q_rec["roles"], [])
+
+            await self.cog.prison.callback(self.cog, ctx, member)
+            p_rec = await self.cog.db.get_prison_record(member.id)
+            self.assertEqual(p_rec, [])
+
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertEqual({r.id for r in member.roles}, {self.default_role.id, self.category_role.id})
+        self.assertNotIn(inmate_role, member.roles)
+        self.assertNotIn(self.q_role, member.roles)
+
+    async def test_account_age_quarantine_to_prison_does_not_preserve_onboarding_roles(self):
+        """Moving an account_age quarantined user to prison does not leak incomplete onboarding roles on release."""
+        self._setup_prison_quarantine_roles()
+        member = self._create_member(
+            user_id=33333,
+            name="FreshAcct",
+            created_days_ago=1,
+            roles=[self.default_role, self.q_role],
+        )
+        await self._attach_live_role_edit(member)
+        await self.cog.db.set_quarantine_record(
+            member.id,
+            roles=[self.user_role1.id],
+            reason="Account too new",
+            q_type="account_age",
+        )
+        staff = self._create_member(user_id=777, name="StaffMod", roles=[self.staff_role])
+        ctx = self._make_staff_ctx(staff)
+
+        with patch.dict(os.environ, {"ENABLE_MODERATION": "True", "ENABLE_CMD_PRISON": "True"}):
+            await self.cog.prison.callback(self.cog, ctx, member)
+            self.assertEqual(await self.cog.db.get_prison_record(member.id), [])
+            await self.cog.release.callback(self.cog, ctx, member)
+
+        self.assertEqual({r.id for r in member.roles}, {self.default_role.id})
+
+    async def test_manual_trusted_role_grant_frees_trust_db_row(self):
+        """Manually granting TRUSTED_ROLE_ID via Discord UI deletes any existing trust_records row."""
+        _, trusted_role, _ = self._setup_prison_quarantine_roles()
+        await self.cog.db.set_trust_points(12345, 17.0)
+        self.cog.trust_cooldowns[12345] = datetime.now(timezone.utc)
+
+        before = self._create_member(user_id=12345, roles=[self.default_role, self.user_role1])
+        after = self._create_member(user_id=12345, roles=[self.default_role, self.user_role1, trusted_role])
+
+        await self.cog.on_member_update(before, after)
+
+        self.assertEqual(await self.cog.db.get_trust_points(12345), 0.0)
+        cur = self.cog.db._get_connection().execute("SELECT 1 FROM trust_records WHERE user_id = ?;", (12345,))
+        self.assertIsNone(cur.fetchone())
+        self.assertNotIn(12345, self.cog.trust_cooldowns)
+
+    async def test_trusted_role_added_while_quarantined_does_not_delete_trust_row(self):
+        """If TRUSTED_ROLE_ID is added to a quarantined user, enforcement strips it and preserves trust_records."""
+        _, trusted_role, _ = self._setup_prison_quarantine_roles()
+        await self.cog.db.set_trust_points(12345, 14.0)
+
+        before = self._create_member(user_id=12345, roles=[self.default_role, self.q_role])
+        after = self._create_member(user_id=12345, roles=[self.default_role, self.q_role, trusted_role])
+
+        await self.cog.on_member_update(before, after)
+
+        after.edit.assert_awaited_once()
+        cur = self.cog.db._get_connection().execute("SELECT points FROM trust_records WHERE user_id = ?;", (12345,))
+        row = cur.fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["points"], 14.0)
+
+
+def utc_clock(at):
+    """Stand-in for datetime.now that only answers when asked for UTC."""
+    def now(tz=None):
+        if tz is not timezone.utc:
+            raise AssertionError("moderation code must read the clock as datetime.now(timezone.utc)")
+        return at
+    return now
 
 
 class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
     ROLE_IDS = [11, 12, 13, 14, 15]
 
     async def asyncSetUp(self):
-        self.test_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "tmp"))
-        os.makedirs(self.test_dir, exist_ok=True)
+        random.seed(20260101)
+        self.test_dir = tempfile.mkdtemp()
         self.db_file = os.path.join(self.test_dir, "test_unc_voice.db")
-        if os.path.exists(self.db_file):
-            os.remove(self.db_file)
         self.db = Database(self.db_file)
 
         bot = MagicMock(spec=commands.Bot)
@@ -708,6 +1196,7 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.cog.unc_role_ids = self.ROLE_IDS
         self.cog.unc_misclick_max_seconds = 3.0
         self.cog.unc_solo_max_seconds = 15.0
+        self.cog.unc_solo_dodge_min_seconds = 10.0
         self.cog.unc_cooldown_seconds = 3600
         self.cog.unc_abuse_threshold = 5
         self.cog.unc_abuse_window_seconds = 604800
@@ -724,6 +1213,10 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.guild.get_channel.return_value = self.general
 
         self.channel = self._channel(1, "lobby")
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
 
     def _channel(self, cid, name):
         ch = MagicMock()
@@ -752,13 +1245,13 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
     async def _join(self, member, channel, at):
         channel.members.append(member)
         with patch("cogs.moderation.datetime") as dt:
-            dt.now.return_value = at
+            dt.now.side_effect = utc_clock(at)
             await self.cog.on_voice_state_update(member, self._state(None), self._state(channel))
 
     async def _leave(self, member, channel, at):
         channel.members.remove(member)
         with patch("cogs.moderation.datetime") as dt:
-            dt.now.return_value = at
+            dt.now.side_effect = utc_clock(at)
             await self.cog.on_voice_state_update(member, self._state(channel), self._state(None))
 
     async def _reset_unc_enforcement(self):
@@ -773,10 +1266,10 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
 
     async def test_alone_for_10_seconds_is_awarded(self):
         m = self._member(1)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=10))
-        self.assertEqual(await self.db.increment_unc_count(1), 2)
+        self.assertEqual(await self.db.get_unc_count(1), 1)
         self.general.send.assert_awaited_once()
         msg = self.general.send.call_args.args[0]
         self.assertIn(m.mention, msg)
@@ -786,17 +1279,17 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
 
     async def test_alone_beyond_limit_is_not_awarded(self):
         m = self._member(1)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=15.5))
         self.general.send.assert_not_awaited()
-        self.assertEqual(await self.db.increment_unc_count(1), 1)
+        self.assertEqual(await self.db.get_unc_count(1), 0)
 
     async def test_not_alone_for_10_seconds_is_not_awarded(self):
         m = self._member(1)
         other = self._member(2)
         self.channel.members.append(other)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=10))
         self.general.send.assert_not_awaited()
@@ -804,7 +1297,7 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
     async def test_someone_joining_then_leaving_voids_solo_status(self):
         m = self._member(1)
         other = self._member(2)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._join(other, self.channel, t0 + timedelta(seconds=2))
         await self._leave(other, self.channel, t0 + timedelta(seconds=4))
@@ -815,21 +1308,21 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
     async def test_classic_misclick_under_3s_with_others_present(self):
         m = self._member(1)
         self.channel.members.append(self._member(2))
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=2))
         self.general.send.assert_awaited_once()
 
     async def test_solo_limit_boundary_exactly_at_limit_not_awarded(self):
         m = self._member(1)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=15))
         self.general.send.assert_not_awaited()
 
     async def test_solo_award_respects_cooldown(self):
         m = self._member(1)
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=10))
         await self._join(m, self.channel, t0 + timedelta(seconds=20))
@@ -843,7 +1336,7 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
     async def _catch(self, m, seconds, others=False):
         if others:
             self.channel.members.append(self._member(99))
-        t0 = datetime(2026, 1, 1, 12, 0, 0)
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
         await self._join(m, self.channel, t0)
         await self._leave(m, self.channel, t0 + timedelta(seconds=seconds))
         return self.general.send.call_args.args[0]
@@ -883,7 +1376,7 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
             await self._reset_unc_enforcement()
             self.channel.members.clear()
             m = self._member(1)
-            seen.add((await self._catch(m, 2, others=True)).split("(Total")[0].replace("<@1>", ""))
+            seen.add(await self._catch(m, 2, others=True))
         self.assertGreaterEqual(len(seen), 5)
 
     async def test_solo_stay_under_or_equal_10s_never_uses_dodge_or_trick_messages(self):
@@ -922,7 +1415,26 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         with patch.dict(os.environ, {"UNC_SOLO_DODGE_MIN_SECONDS": "5.0"}):
             cog = Moderation(MagicMock(), db=self.db)
             self.assertEqual(cog.unc_solo_dodge_min_seconds, 5.0)
-    T0 = datetime(2026, 1, 1, 12, 0, 0)
+
+    async def test_failed_role_update_does_not_break_tracking_of_the_next_channel(self):
+        """Moving between channels leaves one and joins the other; an API error on the award must not lose the join."""
+        m = self._member(1)
+        m.add_roles.side_effect = discord.HTTPException(MagicMock(status=500, reason="x"), "boom")
+        other = self._channel(2, "afk")
+        t0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+        await self._join(m, self.channel, t0)
+        self.channel.members.remove(m)
+        other.members.append(m)
+        with patch("cogs.moderation.datetime") as dt:
+            dt.now.side_effect = utc_clock(t0 + timedelta(seconds=1))
+            await self.cog.on_voice_state_update(m, self._state(self.channel), self._state(other))
+        await self._leave(m, other, t0 + timedelta(seconds=2))
+
+        stays = await self.db.get_unc_short_stays(1, 0.0)
+        self.assertEqual([stay["channel_id"] for stay in stays], [1, 2])
+
+    T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
 
     EXPECTED_ROASTS = {
         "📉 <@1> tried to farm misclicks in lobby but just exposed themselves as a tryhard. Unc privileges revoked.",
@@ -983,6 +1495,15 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         )
 
     # ---- recording ----------------------------------------------------------
+
+    async def test_short_stay_is_stored_as_utc_epoch_seconds(self):
+        # 2026-01-01 12:00:00 UTC is 1767268800 seconds after the Unix epoch.
+        await self._stay(self._member(1), self.channel, self.T0, seconds=1.5)
+        self.assertEqual(
+            await self.db.get_unc_short_stays(1, 0.0),
+            [{"channel_id": 1, "joined_at": 1767268800.0, "left_at": 1767268801.5}],
+        )
+        self.assertEqual((await self.db.get_unc_state(1))["last_counted"], 1767268801.5)
 
     async def test_every_short_stay_is_recorded_even_when_silenced(self):
         m = self._member(1)
@@ -1210,8 +1731,6 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.assertIsNotNone((await self.db.get_unc_state(1))["locked_until"])
 
     async def test_roast_messages_match_expected_texts_and_all_appear(self):
-        import random as _random
-        _random.seed(1234)
         seen = set()
         for _ in range(80):
             await self._reset_unc_enforcement()
@@ -1254,3 +1773,247 @@ class TestUncVoiceTracking(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(cog.unc_abuse_threshold, 7)
         self.assertEqual(cog.unc_abuse_window_seconds, 7200)
         self.assertEqual(cog.unc_abuse_lockout_seconds, 600)
+
+
+class TestTrustAndAntiNuke(unittest.IsolatedAsyncioTestCase):
+    T0 = datetime(2026, 1, 1, 12, 0, 0, tzinfo=timezone.utc)
+
+    async def asyncSetUp(self):
+        self.test_dir = tempfile.mkdtemp()
+        self.db = Database(os.path.join(self.test_dir, "test_trust.db"))
+        bot = MagicMock(spec=commands.Bot)
+        self.cog = Moderation(bot, db=self.db)
+        self.cog.trusted_role_id = 605
+        self.cog.inmate_role_id = 888
+        self.cog.quarantine_role_id = 999
+        self.cog.trust_threshold = 3
+        self.cog.trust_cooldown_seconds = 60
+        self.cog.anti_nuke_limit = 2
+        self.cog.anti_nuke_window = 600
+        self.cog.mods_chat_id = 333
+
+        self.trusted_role = MagicMock(spec=discord.Role, id=605, managed=False)
+        self.q_role = MagicMock(spec=discord.Role, id=999, managed=False)
+        self.mods_chat = MagicMock(spec=discord.TextChannel, id=333)
+        self.mods_chat.send = AsyncMock()
+
+        self.guild = MagicMock(spec=discord.Guild)
+        self.guild.name = "Test Guild"
+        self.guild.get_role.side_effect = {605: self.trusted_role, 999: self.q_role}.get
+        self.guild.get_channel.side_effect = {333: self.mods_chat}.get
+        self.members = {}
+        self.guild.get_member.side_effect = lambda uid: self.members.get(uid)
+        self.audit_entries = []  # newest first, like Discord returns them
+        self.guild.audit_logs = MagicMock(side_effect=self._audit_logs)
+
+    async def asyncTearDown(self):
+        await self.db.close()
+        shutil.rmtree(self.test_dir, ignore_errors=True)
+
+    def _member(self, uid, roles=(), bot=False):
+        member = MagicMock(spec=discord.Member)
+        member.id = uid
+        member.name = f"user{uid}"
+        member.mention = f"<@{uid}>"
+        member.bot = bot
+        member.guild = self.guild
+        member.roles = list(roles)
+        member.add_roles = AsyncMock()
+        member.edit = AsyncMock()
+        member.kick = AsyncMock()
+        member.send = AsyncMock()
+        self.members[uid] = member
+        return member
+
+    # ---- trust --------------------------------------------------------------
+
+    async def _say(self, author, seconds, guild="default"):
+        message = MagicMock(spec=discord.Message)
+        message.author = author
+        message.guild = self.guild if guild == "default" else guild
+        with patch("cogs.moderation.datetime") as dt:
+            dt.now.side_effect = utc_clock(self.T0 + timedelta(seconds=seconds))
+            await self.cog.on_message(message)
+
+    async def test_trusted_role_awarded_exactly_at_threshold(self):
+        member = self._member(1)
+        await self._say(member, 0)
+        await self._say(member, 60)
+        self.assertEqual(await self.db.get_trust_points(1), 2.0)
+        member.add_roles.assert_not_awaited()
+
+        await self._say(member, 120)
+
+        member.add_roles.assert_awaited_once()
+        self.assertIs(member.add_roles.call_args.args[0], self.trusted_role)
+        member.send.assert_awaited_once()
+        self.assertEqual(await self.db.get_trust_points(1), 0.0)
+
+    async def test_messages_inside_cooldown_do_not_count(self):
+        member = self._member(1)
+        await self._say(member, 0)
+        await self._say(member, 1)
+        await self._say(member, 59)
+        self.assertEqual(await self.db.get_trust_points(1), 1.0)
+        await self._say(member, 60)
+        self.assertEqual(await self.db.get_trust_points(1), 2.0)
+
+    async def test_cooldown_is_tracked_per_user(self):
+        await self._say(self._member(1), 0)
+        await self._say(self._member(2), 1)
+        self.assertEqual(await self.db.get_trust_points(1), 1.0)
+        self.assertEqual(await self.db.get_trust_points(2), 1.0)
+
+    async def test_restricted_trusted_bot_and_dm_messages_earn_nothing(self):
+        await self._say(self._member(1, roles=[self.q_role]), 0)
+        await self._say(self._member(2, roles=[MagicMock(spec=discord.Role, id=888)]), 0)
+        await self._say(self._member(3, roles=[self.trusted_role]), 0)
+        await self._say(self._member(4, bot=True), 0)
+        await self._say(self._member(5), 0, guild=None)
+        for uid in (1, 2, 3, 4, 5):
+            self.assertEqual(await self.db.get_trust_points(uid), 0.0)
+
+    async def test_author_without_member_data_is_ignored(self):
+        user = MagicMock(spec=discord.User)
+        user.id = 6
+        user.bot = False
+        await self._say(user, 0)
+        self.assertEqual(await self.db.get_trust_points(6), 0.0)
+
+    async def test_failed_role_grant_is_retried_on_a_later_message(self):
+        member = self._member(1)
+        member.add_roles.side_effect = discord.Forbidden(MagicMock(status=403, reason="x"), "nope")
+        for seconds in (0, 60, 120):
+            await self._say(member, seconds)
+        self.assertEqual(await self.db.get_trust_points(1), 2.0)
+
+        member.add_roles.side_effect = None
+        await self._say(member, 180)
+        self.assertEqual(member.add_roles.await_count, 2)
+        self.assertEqual(await self.db.get_trust_points(1), 0.0)
+
+    async def test_closed_dms_do_not_block_the_role_grant(self):
+        member = self._member(1)
+        member.send.side_effect = discord.Forbidden(MagicMock(status=403, reason="x"), "closed")
+        for seconds in (0, 60, 120):
+            await self._say(member, seconds)
+        member.add_roles.assert_awaited_once()
+        self.assertEqual(await self.db.get_trust_points(1), 0.0)
+
+    # ---- anti-nuke ----------------------------------------------------------
+
+    def _audit_logs(self, limit=None, action=None):
+        entries = self.audit_entries[:limit]
+
+        async def iterate():
+            for entry in entries:
+                yield entry
+
+        return iterate()
+
+    def _channel_deleted_by(self, channel_id, deleter):
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = channel_id
+        channel.guild = self.guild
+        entry = MagicMock()
+        entry.target.id = channel_id
+        entry.user = deleter
+        self.audit_entries.insert(0, entry)
+        return channel
+
+    async def _handle_deletion(self, channel, seconds=0):
+        with patch("asyncio.sleep", new_callable=AsyncMock), patch("cogs.moderation.datetime") as dt:
+            dt.now.side_effect = utc_clock(self.T0 + timedelta(seconds=seconds))
+            await self.cog.on_guild_channel_delete(channel)
+
+    async def test_single_deletion_is_tolerated(self):
+        nuker = self._member(50)
+        await self._handle_deletion(self._channel_deleted_by(1, nuker))
+        nuker.edit.assert_not_awaited()
+        self.mods_chat.send.assert_not_awaited()
+
+    async def test_rapid_deletions_strip_roles_even_when_audit_log_has_newer_entries(self):
+        """In a burst, every handler sees later deletions on top of the audit log and must still find its own."""
+        nuker = self._member(50)
+        first = self._channel_deleted_by(1, nuker)
+        second = self._channel_deleted_by(2, nuker)
+        third = self._channel_deleted_by(3, nuker)
+
+        await self._handle_deletion(first)
+        nuker.edit.assert_not_awaited()
+        await self._handle_deletion(second)
+
+        nuker.edit.assert_awaited_once()
+        self.assertEqual(nuker.edit.call_args.kwargs["roles"], [])
+        self.mods_chat.send.assert_awaited_once()
+        self.assertIn("ANTI-NUKE", self.mods_chat.send.call_args.args[0])
+        self.assertIn("<@50>", self.mods_chat.send.call_args.args[0])
+
+        # The tally restarts after the lockdown; a single further deletion does not re-trigger.
+        await self._handle_deletion(third)
+        nuker.edit.assert_awaited_once()
+
+    async def test_lockdown_removes_everything_except_managed_roles(self):
+        admin_role = MagicMock(spec=discord.Role, id=70, managed=False)
+        booster_role = MagicMock(spec=discord.Role, id=71, managed=True)
+        nuker = self._member(50, roles=[admin_role, booster_role])
+        await self._handle_deletion(self._channel_deleted_by(1, nuker))
+        await self._handle_deletion(self._channel_deleted_by(2, nuker))
+        self.assertEqual(nuker.edit.call_args.kwargs["roles"], [booster_role])
+
+    async def test_rogue_bot_is_kicked(self):
+        rogue = self._member(60, bot=True)
+        await self._handle_deletion(self._channel_deleted_by(1, rogue))
+        await self._handle_deletion(self._channel_deleted_by(2, rogue))
+        rogue.kick.assert_awaited_once()
+        rogue.edit.assert_not_awaited()
+        self.assertIn("kicked", self.mods_chat.send.call_args.args[0])
+
+    async def test_deletions_by_different_users_are_counted_separately(self):
+        a, b = self._member(50), self._member(51)
+        await self._handle_deletion(self._channel_deleted_by(1, a))
+        await self._handle_deletion(self._channel_deleted_by(2, b))
+        a.edit.assert_not_awaited()
+        b.edit.assert_not_awaited()
+
+    async def test_window_boundary(self):
+        slow = self._member(50)
+        await self._handle_deletion(self._channel_deleted_by(1, slow), seconds=0)
+        await self._handle_deletion(self._channel_deleted_by(2, slow), seconds=601)
+        slow.edit.assert_not_awaited()
+
+        fast = self._member(51)
+        await self._handle_deletion(self._channel_deleted_by(3, fast), seconds=1000)
+        await self._handle_deletion(self._channel_deleted_by(4, fast), seconds=1600)
+        fast.edit.assert_awaited_once()
+
+    async def test_deletion_missing_from_audit_log_is_ignored(self):
+        nuker = self._member(50)
+        self._channel_deleted_by(1, nuker)
+        unknown = MagicMock(spec=discord.TextChannel)
+        unknown.id = 999
+        unknown.guild = self.guild
+        await self._handle_deletion(unknown)
+        await self._handle_deletion(unknown)
+        nuker.edit.assert_not_awaited()
+
+    async def test_unreadable_audit_log_does_not_raise(self):
+        self.guild.audit_logs = MagicMock(
+            side_effect=discord.Forbidden(MagicMock(status=403, reason="x"), "Missing Permissions")
+        )
+        channel = MagicMock(spec=discord.TextChannel)
+        channel.id = 1
+        channel.guild = self.guild
+        await self._handle_deletion(channel)
+        self.mods_chat.send.assert_not_awaited()
+
+    async def test_failed_lockdown_alerts_moderators(self):
+        nuker = self._member(50)
+        nuker.edit.side_effect = discord.Forbidden(MagicMock(status=403, reason="x"), "too low")
+        await self._handle_deletion(self._channel_deleted_by(1, nuker))
+        await self._handle_deletion(self._channel_deleted_by(2, nuker))
+        self.assertIn("URGENT", self.mods_chat.send.call_args.args[0])
+
+
+if __name__ == "__main__":
+    unittest.main()

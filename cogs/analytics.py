@@ -19,8 +19,7 @@ from database import db as default_db, Database
 # ---------------------------------------------------------
 # MODULE-LEVEL CONSTANTS
 # ---------------------------------------------------------
-EXCLUDED_CHANNEL_SUFFIXES = ("logs", "log")
-EXCLUDED_CHANNEL_SUFFIX = EXCLUDED_CHANNEL_SUFFIXES
+EXCLUDED_CHANNEL_SUFFIX = "-logs"
 
 ACTIVITY_DAYS_WINDOW = 30
 TOP_USERS_LIMIT = 10
@@ -28,6 +27,7 @@ STATUS_UPDATE_INTERVAL = 5
 EMOJI_SELF_LIMIT = 10
 EMOJI_LEADERBOARD_LIMIT = 15
 EMOJI_DAYS_WINDOW = 30
+EARLIEST_STATS_YEAR = 2015  # Discord's launch year; no server history predates it
 
 COLOR_HOURLY_BAR = "#3b82f6"
 COLOR_DAILY_LINE = "#10b981"
@@ -87,7 +87,18 @@ class Analytics(commands.Cog):
         self.bot = bot
         self.db = db or default_db
 
+        # Flushes are held back while a history sync runs: the sync skips messages that
+        # are still buffered, so the buffer must stay intact until the sync has finished.
         self.is_syncing = False
+        # Flushes are also held back from a new gateway session until its catch-up has
+        # read the watermarks; otherwise a fresh message would move a channel's
+        # watermark past the messages missed while disconnected.
+        self._gap_pending = False
+        self._connect_seq = 0
+        # Serializes history scans that write to the database.
+        self.sync_lock = asyncio.Lock()
+        self._ready_sync_running = False
+        self._ready_sync_requested = False
 
         # In-Memory Buffers for Batch Writing
         self.buffer_lock = asyncio.Lock()
@@ -95,6 +106,8 @@ class Analytics(commands.Cog):
         self.hourly_buffer: Dict[str, int] = defaultdict(int)
         self.channel_sync_buffer: Dict[int, Tuple[int, str]] = {}
         self.emoji_buffer: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+        # IDs of the messages currently represented in the buffers
+        self.buffered_message_ids: set[int] = set()
 
         # Load Settings & Role IDs from Environment
         self.timezone_offset = get_env_int("ANALYTICS_TIMEZONE_OFFSET_HOURS", 3)
@@ -122,10 +135,13 @@ class Analytics(commands.Cog):
 
     @staticmethod
     def _get_month_bounds(year: int, month: int) -> tuple[datetime, datetime]:
-        start_dt = datetime(year, month, 1)
+        """Returns the UTC [start, end) bounds of a calendar month."""
+        start_dt = datetime(year, month, 1, tzinfo=timezone.utc)
         end_dt = (
-            datetime(year + 1, 1, 1) if month == 12 else datetime(year, month + 1, 1)
-        ) - timedelta(seconds=1)
+            datetime(year + 1, 1, 1, tzinfo=timezone.utc)
+            if month == 12
+            else datetime(year, month + 1, 1, tzinfo=timezone.utc)
+        )
         return start_dt, end_dt
 
     @staticmethod
@@ -148,33 +164,63 @@ class Analytics(commands.Cog):
             result.append((y, m))
         return result
 
+    def _drain_buffers(self) -> tuple[dict, dict, dict, dict, set]:
+        """Returns the buffered metrics and empties the buffers. Caller holds buffer_lock."""
+        snapshot = (
+            dict(self.user_buffer),
+            dict(self.hourly_buffer),
+            dict(self.channel_sync_buffer),
+            dict(self.emoji_buffer),
+            set(self.buffered_message_ids),
+        )
+        self.user_buffer.clear()
+        self.hourly_buffer.clear()
+        self.channel_sync_buffer.clear()
+        self.emoji_buffer.clear()
+        self.buffered_message_ids.clear()
+        return snapshot
+
+    async def _requeue(self, users: dict, hourly: dict, syncs: dict, emojis: dict, message_ids: set) -> None:
+        """Puts metrics that could not be written back into the buffers."""
+        async with self.buffer_lock:
+            for key, count in users.items():
+                self.user_buffer[key] += count
+            for key, count in hourly.items():
+                self.hourly_buffer[key] += count
+            for channel_id, watermark in syncs.items():
+                current = self.channel_sync_buffer.get(channel_id)
+                if current is None or watermark[0] > current[0]:
+                    self.channel_sync_buffer[channel_id] = watermark
+            for key, count in emojis.items():
+                self.emoji_buffer[key] += count
+            self.buffered_message_ids |= message_ids
+
     async def flush_buffer(self) -> None:
         """Flushes in-memory accumulated metrics to SQLite in single transactions."""
-        if self.is_syncing:
+        if self.is_syncing or self._gap_pending:
             return
 
         async with self.buffer_lock:
-            if not self.user_buffer and not self.hourly_buffer and not self.channel_sync_buffer and not self.emoji_buffer:
-                return
+            users, hourly, syncs, emojis, message_ids = self._drain_buffers()
 
-            users_snapshot = dict(self.user_buffer)
-            hourly_snapshot = dict(self.hourly_buffer)
-            sync_snapshot = dict(self.channel_sync_buffer)
-            emoji_snapshot = dict(self.emoji_buffer)
-
-            self.user_buffer.clear()
-            self.hourly_buffer.clear()
-            self.channel_sync_buffer.clear()
-            self.emoji_buffer.clear()
-
-        if users_snapshot or hourly_snapshot or sync_snapshot:
-            await self.db.record_messages_batch(users_snapshot, hourly_snapshot, sync_snapshot)
-        if emoji_snapshot:
-            await self.db.record_emoji_batch(emoji_snapshot)
+        # Whatever fails to write goes back into the buffers for the next flush.
+        try:
+            await self.db.record_messages_batch(users, hourly, syncs)
+        except Exception:
+            await self._requeue(users, hourly, syncs, emojis, message_ids)
+            raise
+        try:
+            await self.db.record_emoji_batch(emojis)
+        except Exception:
+            await self._requeue({}, {}, {}, emojis, set())
+            raise
 
     @tasks.loop(seconds=15)
     async def flush_buffer_task(self):
-        await self.flush_buffer()
+        try:
+            await self.flush_buffer()
+        except Exception as e:
+            print(f"⚠️ Analytics buffer flush failed, retrying on the next cycle: {e}")
 
     @tasks.loop(hours=1)
     async def prune_retention_task(self):
@@ -183,8 +229,11 @@ class Analytics(commands.Cog):
         hourly_cutoff = (now_utc - timedelta(days=ACTIVITY_DAYS_WINDOW + 1)).strftime("%Y-%m-%d %H")
         emoji_cutoff = (now_utc - timedelta(days=EMOJI_DAYS_WINDOW + 1)).strftime("%Y-%m-%d")
 
-        await self.db.prune_activity_hourly(hourly_cutoff)
-        await self.db.prune_emoji_daily_usage(emoji_cutoff)
+        try:
+            await self.db.prune_activity_hourly(hourly_cutoff)
+            await self.db.prune_emoji_daily_usage(emoji_cutoff)
+        except Exception as e:
+            print(f"⚠️ Analytics retention prune failed, retrying on the next cycle: {e}")
 
     # ---------------------------------------------------------
     # EVENT LISTENERS
@@ -210,24 +259,53 @@ class Analytics(commands.Cog):
             self.user_buffer[user_key] += 1
             self.hourly_buffer[date_hour] += 1
             self.channel_sync_buffer[message.channel.id] = (message.id, now_utc.isoformat())
+            self.buffered_message_ids.add(message.id)
 
             if emojis:
                 for emoji, count in Counter(emojis).items():
                     self.emoji_buffer[(date_str, message.author.id, message.author.display_name, emoji)] += count
 
     @commands.Cog.listener()
+    async def on_connect(self):
+        """A new gateway session started: messages may have been missed since the last one."""
+        self._connect_seq += 1
+        self._gap_pending = True
+
+    @commands.Cog.listener()
     async def on_ready(self):
         """Performs initial 30-day baseline backfill on first boot, or catch-up sync across server channels."""
-        is_synced = await self.db.is_initial_sync_done()
-        if not is_synced:
+        # READY fires again after every gateway reconnect. A sync that is already
+        # running is asked to go around once more instead of running two at a time.
+        self._ready_sync_requested = True
+        if self._ready_sync_running:
+            return
+        self._ready_sync_running = True
+        try:
+            while self._ready_sync_requested:
+                self._ready_sync_requested = False
+                connect_seq = self._connect_seq
+                try:
+                    await self._sync_guilds()
+                finally:
+                    if connect_seq == self._connect_seq:
+                        self._gap_pending = False
+        finally:
+            self._ready_sync_running = False
+        await self.flush_buffer()
+
+    async def _sync_guilds(self) -> None:
+        if not await self.db.is_initial_sync_done():
             print("⚙️ Initial SQLite startup detected. Starting one-time 30-day baseline backfill across channels...")
+            succeeded = True
             for guild in self.bot.guilds:
                 try:
                     await self.initial_30d_backfill(guild)
                 except Exception as e:
+                    succeeded = False
                     print(f"⚠️ Initial backfill error for {guild.name}: {e}")
-            await self.db.set_initial_sync_done(True)
-            print("✅ One-time 30-day baseline backfill complete! Future boots will use fast delta catch-up.")
+            if succeeded:
+                await self.db.set_initial_sync_done(True)
+                print("✅ One-time 30-day baseline backfill complete! Future boots will use fast delta catch-up.")
         else:
             for guild in self.bot.guilds:
                 try:
@@ -236,135 +314,151 @@ class Analytics(commands.Cog):
                     print(f"⚠️ Catch-up sync warning for {guild.name}: {e}")
 
     async def initial_30d_backfill(self, guild: discord.Guild) -> None:
-        """One-time 30-day baseline history scan covering activity, emojis, current month users, and watermarks."""
-        self.is_syncing = True
-        try:
-            now_utc = datetime.now(timezone.utc)
-            cutoff_snowflake = discord.utils.time_snowflake(now_utc)
-            thirty_days_ago = now_utc - timedelta(days=ACTIVITY_DAYS_WINDOW)
-            start_of_month = datetime(now_utc.year, now_utc.month, 1, tzinfo=timezone.utc)
-            scan_start_dt = min(thirty_days_ago, start_of_month)
+        """Rebuilds the 30-day activity and emoji windows, the current month's user counts, and watermarks.
 
-            # Clear current incomplete month's user activity so we rebuild it accurately without double counting
-            await self.db.clear_month_user_activity(now_utc.year, now_utc.month)
+        The rebuilt ranges are replaced atomically, so running this repeatedly never accumulates counts.
+        """
+        async with self.sync_lock:
+            self.is_syncing = True
+            try:
+                now_utc = datetime.now(timezone.utc)
+                # Messages newer than this arrive through the gateway and are buffered.
+                cutoff_snowflake = discord.utils.time_snowflake(now_utc)
+                # Windows start on bucket boundaries so every rebuilt bucket is complete.
+                hourly_start = (now_utc - timedelta(days=ACTIVITY_DAYS_WINDOW)).replace(
+                    minute=0, second=0, microsecond=0
+                )
+                emoji_start = (now_utc - timedelta(days=EMOJI_DAYS_WINDOW)).replace(
+                    hour=0, minute=0, second=0, microsecond=0
+                )
+                start_of_month = datetime(now_utc.year, now_utc.month, 1, tzinfo=timezone.utc)
+                scan_start_dt = min(hourly_start, emoji_start, start_of_month)
 
-            user_increments: Dict[Tuple[int, int, int, str], int] = defaultdict(int)
-            hourly_increments: Dict[str, int] = defaultdict(int)
-            sync_updates: Dict[int, Tuple[int, str]] = {}
-            emoji_increments: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+                user_increments: Dict[Tuple[int, int, int, str], int] = defaultdict(int)
+                hourly_increments: Dict[str, int] = defaultdict(int)
+                sync_updates: Dict[int, Tuple[int, str]] = {}
+                emoji_increments: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
 
-            for channel in guild.text_channels:
-                if not channel.permissions_for(guild.me).read_message_history:
-                    continue
-                if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
-                    continue
+                for channel in guild.text_channels:
+                    if not channel.permissions_for(guild.me).read_message_history:
+                        continue
+                    if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
+                        continue
 
-                try:
-                    latest_id = None
-                    latest_ts = None
-                    async for msg in channel.history(
-                        limit=None,
-                        after=scan_start_dt,
-                        before=discord.Object(id=cutoff_snowflake),
-                        oldest_first=True,
-                    ):
-                        if msg.author.bot:
-                            continue
-                        m_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+                    try:
+                        latest_id = None
+                        latest_ts = None
+                        async for msg in channel.history(
+                            limit=None,
+                            after=scan_start_dt,
+                            before=discord.Object(id=cutoff_snowflake),
+                            oldest_first=True,
+                        ):
+                            # Buffered messages are counted when the buffer is flushed.
+                            if msg.author.bot or msg.id in self.buffered_message_ids:
+                                continue
+                            m_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
 
-                        # Only count current month in user_monthly_activity (prior months are preserved from legacy migration)
-                        if m_utc.year == now_utc.year and m_utc.month == now_utc.month:
-                            ukey = (m_utc.year, m_utc.month, msg.author.id, str(msg.author))
-                            user_increments[ukey] += 1
+                            # Only the current month is rebuilt in user_monthly_activity; earlier months keep their data.
+                            if m_utc >= start_of_month:
+                                ukey = (m_utc.year, m_utc.month, msg.author.id, str(msg.author))
+                                user_increments[ukey] += 1
 
-                        # Hourly activity (last 30 days)
-                        if m_utc >= thirty_days_ago:
-                            hourly_increments[m_utc.strftime("%Y-%m-%d %H")] += 1
+                            if m_utc >= hourly_start:
+                                hourly_increments[m_utc.strftime("%Y-%m-%d %H")] += 1
 
-                        # Emojis (last 30 days)
-                        if m_utc >= thirty_days_ago:
-                            emojis = extract_emojis(msg.content)
-                            if emojis:
-                                dstr = m_utc.strftime("%Y-%m-%d")
-                                for emo, ecount in Counter(emojis).items():
-                                    emoji_increments[(dstr, msg.author.id, msg.author.display_name, emo)] += ecount
+                            if m_utc >= emoji_start:
+                                emojis = extract_emojis(msg.content)
+                                if emojis:
+                                    dstr = m_utc.strftime("%Y-%m-%d")
+                                    for emo, ecount in Counter(emojis).items():
+                                        emoji_increments[(dstr, msg.author.id, msg.author.display_name, emo)] += ecount
 
-                        latest_id = msg.id
-                        latest_ts = m_utc.isoformat()
+                            latest_id = msg.id
+                            latest_ts = m_utc.isoformat()
 
-                    if latest_id:
-                        sync_updates[channel.id] = (latest_id, latest_ts)
-                    elif channel.last_message_id:
-                        sync_updates[channel.id] = (channel.last_message_id, now_utc.isoformat())
-                except discord.Forbidden:
-                    pass
+                        if latest_id:
+                            sync_updates[channel.id] = (latest_id, latest_ts)
+                        elif channel.last_message_id:
+                            sync_updates[channel.id] = (channel.last_message_id, now_utc.isoformat())
+                    except discord.Forbidden:
+                        pass
 
-            if user_increments or hourly_increments or sync_updates:
-                await self.db.record_messages_batch(user_increments, hourly_increments, sync_updates)
-            if emoji_increments:
-                await self.db.record_emoji_batch(emoji_increments)
-        finally:
-            self.is_syncing = False
+                await self.db.replace_activity_baseline(
+                    year=now_utc.year,
+                    month=now_utc.month,
+                    user_increments=user_increments,
+                    hourly_start=hourly_start.strftime("%Y-%m-%d %H"),
+                    hourly_increments=hourly_increments,
+                    emoji_start=emoji_start.strftime("%Y-%m-%d"),
+                    emoji_increments=emoji_increments,
+                    channel_sync_updates=sync_updates,
+                )
+            finally:
+                self.is_syncing = False
             await self.flush_buffer()
 
     async def catch_up_sync(self, guild: discord.Guild) -> None:
         """Pulls only missed messages since channel last watermark (zero data loss)."""
-        self.is_syncing = True
-        try:
-            now_utc = datetime.now(timezone.utc)
-            cutoff_snowflake = discord.utils.time_snowflake(now_utc)
-            channel_syncs = await self.db.get_all_channel_syncs()
-            user_increments: Dict[Tuple[int, int, int, str], int] = defaultdict(int)
-            hourly_increments: Dict[str, int] = defaultdict(int)
-            sync_updates: Dict[int, Tuple[int, str]] = {}
-            emoji_increments: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
+        async with self.sync_lock:
+            self.is_syncing = True
+            try:
+                now_utc = datetime.now(timezone.utc)
+                # Messages newer than this arrive through the gateway and are buffered.
+                cutoff_snowflake = discord.utils.time_snowflake(now_utc)
+                channel_syncs = await self.db.get_all_channel_syncs()
+                user_increments: Dict[Tuple[int, int, int, str], int] = defaultdict(int)
+                hourly_increments: Dict[str, int] = defaultdict(int)
+                sync_updates: Dict[int, Tuple[int, str]] = {}
+                emoji_increments: Dict[Tuple[str, int, str, str], int] = defaultdict(int)
 
-            for channel in guild.text_channels:
-                if not channel.permissions_for(guild.me).read_message_history:
-                    continue
-                if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
-                    continue
+                for channel in guild.text_channels:
+                    if not channel.permissions_for(guild.me).read_message_history:
+                        continue
+                    if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
+                        continue
 
-                last_id = channel_syncs.get(channel.id)
-                if last_id:
-                    try:
-                        latest_id = last_id
-                        latest_ts = None
-                        async for msg in channel.history(
-                            limit=None,
-                            after=discord.Object(id=last_id),
-                            before=discord.Object(id=cutoff_snowflake),
-                            oldest_first=True,
-                        ):
-                            if msg.author.bot:
-                                continue
-                            now_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
-                            ukey = (now_utc.year, now_utc.month, msg.author.id, str(msg.author))
-                            user_increments[ukey] += 1
-                            hourly_increments[now_utc.strftime("%Y-%m-%d %H")] += 1
-                            latest_id = msg.id
-                            latest_ts = now_utc.isoformat()
+                    last_id = channel_syncs.get(channel.id)
+                    if last_id:
+                        try:
+                            latest_id = last_id
+                            latest_ts = None
+                            async for msg in channel.history(
+                                limit=None,
+                                after=discord.Object(id=last_id),
+                                before=discord.Object(id=cutoff_snowflake),
+                                oldest_first=True,
+                            ):
+                                # Buffered messages are counted when the buffer is flushed.
+                                if msg.author.bot or msg.id in self.buffered_message_ids:
+                                    continue
+                                m_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
+                                ukey = (m_utc.year, m_utc.month, msg.author.id, str(msg.author))
+                                user_increments[ukey] += 1
+                                hourly_increments[m_utc.strftime("%Y-%m-%d %H")] += 1
+                                latest_id = msg.id
+                                latest_ts = m_utc.isoformat()
 
-                            emojis = extract_emojis(msg.content)
-                            if emojis:
-                                dstr = now_utc.strftime("%Y-%m-%d")
-                                for emo, ecount in Counter(emojis).items():
-                                    emoji_increments[(dstr, msg.author.id, msg.author.display_name, emo)] += ecount
+                                emojis = extract_emojis(msg.content)
+                                if emojis:
+                                    dstr = m_utc.strftime("%Y-%m-%d")
+                                    for emo, ecount in Counter(emojis).items():
+                                        emoji_increments[(dstr, msg.author.id, msg.author.display_name, emo)] += ecount
 
-                        if latest_ts and latest_id != last_id:
-                            sync_updates[channel.id] = (latest_id, latest_ts)
-                    except discord.Forbidden:
-                        pass
-                else:
-                    if channel.last_message_id:
-                        sync_updates[channel.id] = (channel.last_message_id, now_utc.isoformat())
+                            if latest_ts and latest_id != last_id:
+                                sync_updates[channel.id] = (latest_id, latest_ts)
+                        except discord.Forbidden:
+                            pass
+                    else:
+                        if channel.last_message_id:
+                            sync_updates[channel.id] = (channel.last_message_id, now_utc.isoformat())
 
-            if user_increments or hourly_increments or sync_updates:
-                await self.db.record_messages_batch(user_increments, hourly_increments, sync_updates)
-            if emoji_increments:
-                await self.db.record_emoji_batch(emoji_increments)
-        finally:
-            self.is_syncing = False
+                if user_increments or hourly_increments or sync_updates:
+                    await self.db.record_messages_batch(user_increments, hourly_increments, sync_updates)
+                if emoji_increments:
+                    await self.db.record_emoji_batch(emoji_increments)
+            finally:
+                self.is_syncing = False
             await self.flush_buffer()
 
     async def _scrape_month_data(
@@ -375,47 +469,45 @@ class Analytics(commands.Cog):
         status_msg: discord.Message = None,
         progress_prefix: str = "",
     ) -> None:
-        """Scrapes message history for a specific month and stores directly into SQLite."""
+        """Scrapes a month of message history and replaces that month's per-user counts in SQLite.
+
+        Only user_monthly_activity is written: the rolling hourly table and the channel
+        watermarks describe live tracking and must not be touched by historical scans.
+        """
         start_dt, end_dt = self._get_month_bounds(year, month)
-        is_complete = end_dt < datetime.now()
+        is_complete = end_dt <= datetime.now(timezone.utc)
         total_channels = len(guild.text_channels)
 
         user_counts = defaultdict(lambda: {"name": "Unknown User", "count": 0})
-        hourly_counts: Dict[str, int] = defaultdict(int)
-        sync_updates: Dict[int, Tuple[int, str]] = {}
 
-        for idx, channel in enumerate(guild.text_channels, 1):
-            if not channel.permissions_for(guild.me).read_message_history:
-                continue
-            if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
-                continue
+        async with self.sync_lock:
+            for idx, channel in enumerate(guild.text_channels, 1):
+                if not channel.permissions_for(guild.me).read_message_history:
+                    continue
+                if channel.name.lower().endswith(EXCLUDED_CHANNEL_SUFFIX):
+                    continue
 
-            if status_msg and idx % STATUS_UPDATE_INTERVAL == 0:
-                await status_msg.edit(
-                    content=f"{progress_prefix} — Scanning channel {idx}/{total_channels}..."
-                )
+                if status_msg and idx % STATUS_UPDATE_INTERVAL == 0:
+                    await status_msg.edit(
+                        content=f"{progress_prefix} — Scanning channel {idx}/{total_channels}..."
+                    )
 
-            try:
-                async for msg in channel.history(limit=None, after=start_dt, before=end_dt):
-                    if msg.author.bot:
-                        continue
-                    uid = msg.author.id
-                    user_counts[uid]["name"] = str(msg.author)
-                    user_counts[uid]["count"] += 1
+                try:
+                    async for msg in channel.history(limit=None, after=start_dt, before=end_dt):
+                        if msg.author.bot:
+                            continue
+                        uid = msg.author.id
+                        user_counts[uid]["name"] = str(msg.author)
+                        user_counts[uid]["count"] += 1
+                except discord.Forbidden:
+                    pass
 
-                    now_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
-                    hourly_counts[now_utc.strftime("%Y-%m-%d %H")] += 1
-                    sync_updates[channel.id] = (msg.id, now_utc.isoformat())
-            except discord.Forbidden:
-                pass
-
-        batch_users = {
-            (year, month, uid, info["name"]): info["count"]
-            for uid, info in user_counts.items()
-        }
-        await self.db.record_messages_batch(batch_users, hourly_counts, sync_updates)
-        if is_complete:
-            await self.db.set_month_complete(year, month, is_complete=True)
+            await self.db.replace_month_user_activity(
+                year,
+                month,
+                {uid: (info["name"], info["count"]) for uid, info in user_counts.items()},
+                mark_complete=is_complete,
+            )
 
     # ---------------------------------------------------------
     # ANALYTICS COMMANDS
@@ -431,6 +523,31 @@ class Analytics(commands.Cog):
             await status_msg.edit(content="✅ 30-day baseline backfill successfully completed!")
         except Exception as e:
             await status_msg.edit(content=f"⚠️ Failed to complete baseline sync: {e}")
+
+    @commands.command(name="rescrape")
+    @commands.has_permissions(administrator=True)
+    async def rescrape(self, ctx, year: int, month: int):
+        """Recounts one finished month from message history, replacing its stored per-user counts (Admin only)."""
+        now = datetime.now(timezone.utc)
+        if not (EARLIEST_STATS_YEAR <= year <= now.year) or not (1 <= month <= 12):
+            return await ctx.send(
+                f"⚠️ Usage: `!rescrape <year> <month>` with a year from {EARLIEST_STATS_YEAR} to {now.year} and a month from 1 to 12."
+            )
+
+        _, end_dt = self._get_month_bounds(year, month)
+        if end_dt > now:
+            return await ctx.send(
+                "⚠️ Only finished months can be recounted. The current month is tracked live; use `!syncbaseline` to rebuild it."
+            )
+
+        prefix = f"⏳ Recounting message history for **{year}-{month:02d}**"
+        status_msg = await ctx.send(f"{prefix}...")
+        await self._scrape_month_data(ctx.guild, year, month, status_msg, prefix)
+
+        total = (await self.db.get_monthly_totals([(year, month)]))[(year, month)]
+        await status_msg.edit(
+            content=f"✅ Recounted **{year}-{month:02d}**: {total:,} messages currently in the server's history."
+        )
 
     @commands.command(name="activity30")
     async def activity30(self, ctx):
@@ -449,12 +566,11 @@ class Analytics(commands.Cog):
 
         rows = await self.db.get_activity_30_days(start_date_hour)
 
-        # Baseline backfill if activity table has no rows
-        if not rows:
+        # Bootstrap scan, only until the baseline backfill has populated the table.
+        # Monthly user counts and watermarks belong to that backfill and are left alone here.
+        if not rows and not await self.db.is_initial_sync_done():
             await status_msg.edit(content="📊 Initializing 30-day activity baseline cache...")
-            user_increments = defaultdict(int)
             hourly_increments = defaultdict(int)
-            sync_updates = {}
 
             for channel in ctx.guild.text_channels:
                 if not channel.permissions_for(ctx.guild.me).read_message_history:
@@ -467,15 +583,12 @@ class Analytics(commands.Cog):
                         if msg.author.bot:
                             continue
                         m_utc = msg.created_at.astimezone(timezone.utc) if msg.created_at.tzinfo else msg.created_at.replace(tzinfo=timezone.utc)
-                        ukey = (m_utc.year, m_utc.month, msg.author.id, str(msg.author))
-                        user_increments[ukey] += 1
                         hourly_increments[m_utc.strftime("%Y-%m-%d %H")] += 1
-                        sync_updates[channel.id] = (msg.id, m_utc.isoformat())
                 except discord.Forbidden:
                     pass
 
-            if user_increments or hourly_increments:
-                await self.db.record_messages_batch(user_increments, hourly_increments, sync_updates)
+            if hourly_increments:
+                await self.db.record_messages_batch({}, hourly_increments, {})
                 rows = await self.db.get_activity_30_days(start_date_hour)
 
         hourly_counts = {i: 0 for i in range(24)}
@@ -496,7 +609,7 @@ class Analytics(commands.Cog):
         # 1. Generate Hourly Bar Chart
         plt.figure(figsize=(10, 5))
         plt.bar(list(hourly_counts.keys()), list(hourly_counts.values()), color=COLOR_HOURLY_BAR)
-        plt.title(f"Activity by Hour (UTC+{self.timezone_offset}) [Server-wide]")
+        plt.title(f"Activity by Hour (UTC{self.timezone_offset:+d}) [Server-wide]")
         plt.xlabel("Hour (0:00 - 23:00)")
         plt.ylabel("Total Messages")
         plt.xticks(range(24))
@@ -561,11 +674,8 @@ class Analytics(commands.Cog):
         # Identify missing past months that need historical scraping (Option A)
         missing_past_months = []
         for y, m in month_list:
-            start_dt, end_dt = self._get_month_bounds(y, m)
-            # Compare tz-aware
-            if end_dt.tzinfo is None:
-                end_dt = end_dt.replace(tzinfo=timezone.utc)
-            if end_dt < now_utc:
+            _, end_dt = self._get_month_bounds(y, m)
+            if end_dt <= now_utc:
                 is_complete = await self.db.is_month_complete(y, m)
                 if not is_complete:
                     missing_past_months.append((y, m))
@@ -675,7 +785,12 @@ class Analytics(commands.Cog):
                 "⚠️ Please provide at least a year. Example: `!topusers 2026` or `!topusers 2026 9`"
             )
 
-        now = datetime.now()
+        now = datetime.now(timezone.utc)
+
+        if not (EARLIEST_STATS_YEAR <= year <= now.year):
+            return await ctx.send(
+                f"⚠️ Year must be between {EARLIEST_STATS_YEAR} and {now.year}."
+            )
 
         if month is None:
             target_months = list(range(1, 13))
@@ -698,7 +813,7 @@ class Analytics(commands.Cog):
                 continue
 
             is_complete = await self.db.is_month_complete(year, m)
-            if not is_complete and end_dt < now:
+            if not is_complete and end_dt <= now:
                 all_months_complete = False
                 prefix = f"⏳ Gathering data for **{title}** (Scanning {year}-{m:02d})"
                 if not status_msg:
@@ -847,8 +962,8 @@ class Analytics(commands.Cog):
             ctx.author.id, start_date, limit=EMOJI_SELF_LIMIT
         )
 
-        # Baseline fallback if database table has no data for this user
-        if not top_emojis:
+        # Bootstrap scan, only until the baseline backfill has populated the table
+        if not top_emojis and not await self.db.is_initial_sync_done():
             user_emoji_counts = Counter()
             for channel in ctx.guild.text_channels:
                 if not channel.permissions_for(ctx.guild.me).read_message_history:
@@ -926,8 +1041,8 @@ class Analytics(commands.Cog):
             start_date, limit=EMOJI_LEADERBOARD_LIMIT
         )
 
-        # Baseline fallback if database table has no data yet
-        if not leaderboard:
+        # Bootstrap scan, only until the baseline backfill has populated the table
+        if not leaderboard and not await self.db.is_initial_sync_done():
             total_counts = Counter()
             emoji_user_counts = defaultdict(Counter)
             user_names = {}

@@ -15,11 +15,12 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **AutoMod New Member Monitoring**: Gate Greeter actively monitors new members who joined the server less than 7 days ago (`QUARANTINE_NEW_MEMBER_DAYS`). If they trigger Discord AutoMod (e.g., banned words, mention spam, or regex filters), they are immediately dragged to quarantine, their prior roles are preserved, and they receive an @-pinged explanation in the quarantine channel with a one-click staff release button.
 - **Evasion Prevention & Strict Role Enforcement**:
   - If an imprisoned or quarantined user leaves and rejoins the server to bypass their lockdown, the bot detects their return, strips any newly acquired onboarding roles, drags them back into prison or quarantine, and logs the evasion attempt.
+  - Discord-managed roles (Server Booster, integration roles) cannot be removed by bots, so prisoners and quarantined members keep them; every other non-category role is stripped and saved.
   - Monitors member role updates in real time (`on_member_update`) and immediately strips any unauthorized self-assigned or onboarding roles acquired while a user is in Quarantine or Prison.
 - **"Unc" Misclick Dynasty**: Detects users who misclick voice channels (joining and leaving within `UNC_MISCLICK_MAX_SECONDS`, default 3.0s), or sitting completely alone in an empty channel for up to `UNC_SOLO_MAX_SECONDS` (default 25s), and assigns them the "Unc" role. Solo stays longer than `UNC_SOLO_DODGE_MIN_SECONDS` (default 10.0s) trigger dedicated timer-dodging and tricking callouts, whereas shorter solo stays use harmless wandering templates. Includes a 5-tier progression system (Unc ➔ Grand Unc ➔ Great-Grand Unc ➔ Ancestral Unc ➔ The First Unc) tracked persistently in the database, protected by a configurable anti-spam cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour).
   - **Anti-gaming protection (rolling trap)**: every short stay is recorded. If a user is currently shadowbanned, further short stays are silently ignored and extend the lockout by `UNC_ABUSE_LOCKOUT_SECONDS` (default 6 hours). When the user accumulates `UNC_ABUSE_THRESHOLD` (default 5) short stays within `UNC_ABUSE_WINDOW_SECONDS` (default 7 days / 604800s), they receive a public roast, are not awarded, and are locked out for 6 hours. History is never cleared on lockout and only leaves the record by naturally aging out of the 7-day rolling window. If the lockout expires and they still have 5+ short stays within the 7-day window, their next attempt triggers another roast and reapplies the 6-hour lockout. Cooldown (`UNC_COOLDOWN_SECONDS`, default 1 hour) applies to awards between normal misclicks. Lockouts and roasts do not demote a user or strip previously earned Unc roles. Cooldown, lockout, and history are stored in SQLite and survive restarts.
 - **Trust System (Anti-Raid Media Permissions)**: Protects the server by automatically awarding a "Trusted Media" role once a non-restricted user reaches `TRUST_THRESHOLD` (default 30) valid chat interactions. Features a configurable cooldown (`TRUST_COOLDOWN_SECONDS`, default 60s) between counted messages to prevent spamming.
-- **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
+- **Anti-Nuke System (Channel Deletion Protection)**: Monitors server audit logs for channel deletions. If a user or bot deletes `ANTI_NUKE_CHANNEL_LIMIT` (default 2) channels within `ANTI_NUKE_WINDOW_SECONDS` (default 600s / 10 minutes), the bot automatically kicks rogue bots or strips all removable roles from compromised human accounts and alerts moderators in `MODS_CHAT_ID`.
 
 ### 🗂️ Server Backup & Snapshot
 - **Server Structure Snapshot (`!snapshot`)**: Captures the complete structural state of the server—including server settings, roles (hierarchy order, colors, hoist/mentionable flags, and permissions), categories, and channels (text, voice, stage, forum, announcement settings, and role permission overwrites).
@@ -30,14 +31,15 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **Strict Zero-User-Data Policy**: Never stores messages, member lists, or user-specific channel overwrites (only `discord.Role` overwrites are recorded).
 
 ### 📈 Analytics
-*Channels ending in `logs` or `log` are excluded from tracking.*
+*Channels whose name ends in `-logs` are excluded from tracking.*
 - **`!activity [months]`**: Generates a monthly message activity graph for the past number of months (default 12, up to 120). Automatically backfills and scrapes unarchived historical months on demand.
 - **`!topusers [year] <month>`**: Displays the top 10 most active members for a given year or specific month.
 - **`!activity30`**: Generates 30-day hourly (adjusted by `ANALYTICS_TIMEZONE_OFFSET_HOURS`) and daily server-wide message activity graphs.
 - **`!pronounstats <year>`**: Graphs demographics for active users (`PRONOUN_ACTIVE_MSG_THRESHOLD`+ messages in a single month) across configured pronoun roles (`PRONOUN_ROLE_IDS`).
 - **`!myemojis`**: Displays your top 10 most used emojis over the past 30 days, along with total unique emojis and total usage counts.
 - **`!emojileaderboard`**: Server-wide leaderboard ranking the top 15 most used emojis over the past 30 days, their total uses, and the top user for each emoji.
-- **`!syncbaseline`**: Admin-only command to trigger a 30-day baseline backfill across channels.
+- **`!rescrape [year] [month]`**: Admin-only command that recounts one finished month from message history and replaces its stored per-user counts. Messages and channels deleted since then are no longer part of the history and are not counted.
+- **`!syncbaseline`**: Admin-only command that rebuilds the 30-day activity and emoji statistics and the current month's user counts from message history. The rebuilt ranges are replaced, so it is safe to run repeatedly.
 
 ### 🤖 Auto Responder & Core Functions
 - **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
@@ -150,3 +152,11 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    ```bash
    python main.py
    ```
+   The SQLite file is created as `bot_database.db` in the working directory; set `DATABASE_PATH` (environment or `.env`) to store it elsewhere.
+
+## Running the Tests
+
+The suite uses the standard library `unittest` runner and needs only the packages from `requirements.txt`:
+```bash
+python -m unittest discover -s tests
+```
