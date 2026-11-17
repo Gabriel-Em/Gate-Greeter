@@ -42,7 +42,7 @@ A modular Discord bot built with `discord.py` designed for stable operations, ro
 - **`!syncbaseline`**: Admin-only command that rebuilds the 30-day activity and emoji statistics and the current month's user counts from message history. The rebuilt ranges are replaced, so it is safe to run repeatedly.
 
 ### 🤖 Auto Responder & Core Functions
-- **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`).
+- **Auto Responder**: Handles regex-triggered explanations in server channels—automatically replying to queries about VO2 Max (`ENABLE_RESP_VO2MAX`) and whether Alex O'Connor is on or runs the server (`ENABLE_RESP_ALEX`). It also answers questions about members who have gone quiet or left ("where is X?", "what happened to X?", "did X leave?", "haven't seen X in a while") with a reply configured per member in `.env` (`ENABLE_RESP_ABSENT`, see `ABSENT_NAMES_<KEY>` / `ABSENT_IDS_<KEY>` / `ABSENT_REPLY_<KEY>` below); several members asked about in one message get their replies combined.
 - **Dynamic Help (`!help`)**: A custom embed help command that displays all available commands, their arguments, and whether they are currently `Active` or `Disabled` based on the `.env` configuration.
 - **Admin Restart (`!restart`)**: Allows admins to trigger a container reboot and pull the latest code directly from Discord.
 - **Global Error Handling**: Intercepts unknown commands, invalid/missing arguments, permission errors, and internal backend crashes, sending formatted feedback directly to the Discord channel.
@@ -96,6 +96,17 @@ Persistent state is stored in an embedded SQLite database (`bot_database.db`) co
    # Granular Auto-Responders
    ENABLE_RESP_VO2MAX=True
    ENABLE_RESP_ALEX=True
+   ENABLE_RESP_ABSENT=True
+
+   # Absent-Member Responder: answers "where is X / what happened to X / did X leave / haven't seen X" questions.
+   # Add one group per person; the <KEY> suffix (any name you like) links the lines together.
+   #   ABSENT_NAMES_<KEY>  comma-separated names/nicknames (whole words, any case)
+   #   ABSENT_IDS_<KEY>    optional comma-separated Discord user IDs, so @mentions match too
+   #   ABSENT_REPLY_<KEY>  the reply; use double quotes and \n for line breaks
+   # Several people asked about in one message get their replies combined. Restart the bot after editing.
+   # ABSENT_NAMES_JOHN=John,Johnny
+   # ABSENT_IDS_JOHN=700000000000000001
+   # ABSENT_REPLY_JOHN="John is taking a break from Discord.\nHe's doing fine!"
 
    # Moderation Commands
    ENABLE_CMD_PRISON=True
